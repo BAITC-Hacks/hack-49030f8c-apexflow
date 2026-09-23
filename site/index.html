@@ -29,7 +29,7 @@
         <span class="notice-icon" aria-hidden="true">i</span>
         <div>
           <strong>Публичная статическая демонстрация</strong>
-          <p>Страница работает на искусственном наборе и не публикует исходные банковские данные. Полная версия с pipeline и реальными CSV запускается локально через Docker.</p>
+        <p>Страница работает на искусственном наборе и не публикует исходные банковские данные. Для полного локального расчёта в Docker необходимы интеграция аналитики и исходные Parquet; текущий статус указан в README.</p>
         </div>
       </section>
 
@@ -39,7 +39,7 @@
             <p class="eyebrow">Демонстрационный экран</p>
             <h2 id="workspace-title">Рабочее место аналитика</h2>
           </div>
-          <p class="source-label">Синтетический набор · не результат анализа</p>
+            <p class="source-label">7 искусственных узлов · роли и scores заданы для проверки экрана</p>
         </div>
 
         <div class="metrics" aria-label="Сводка сети">
@@ -71,7 +71,7 @@
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Ранг</th><th>gid</th><th>Роль</th><th>Приоритет</th></tr></thead>
+                <thead><tr><th>Ранг</th><th>gid</th><th>Роль</th><th>Приоритет</th><th>Почему в очереди</th></tr></thead>
                 <tbody id="top-table"></tbody>
               </table>
             </div>
@@ -113,6 +113,11 @@
               <span>стрелка: src → dst</span>
             </div>
           </div>
+          <div class="graph-controls">
+            <label for="graph-mode"><span>Область графа</span><select id="graph-mode"><option value="neighborhood">Непосредственные соседи</option><option value="cluster">Выбранный кластер</option></select></label>
+            <label for="graph-color"><span>Окраска</span><select id="graph-color"><option value="role">По ролям</option><option value="cluster">По кластерам</option></select></label>
+          </div>
+          <div id="color-legend" class="legend" aria-label="Цвета графа"></div>
           <svg id="network" viewBox="0 0 960 420" role="img" aria-label="Направленный граф выбранного окружения"></svg>
           <p id="graph-caption" class="panel-footnote"></p>
         </section>
@@ -153,6 +158,7 @@
       <span>© ApexFlow · HackAlem AI</span>
       <a href="https://github.com/BAITC-Hacks/hack-49030f8c-apexflow">GitHub repository ↗</a>
     </footer>
-    <script src="app.js"></script>
+    <noscript><p>Для интерактивной демонстрации включите JavaScript в браузере.</p></noscript>
+    <script type="module" src="app.js"></script>
   </body>
 </html>

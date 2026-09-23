@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import html
 import math
 
 import pandas as pd
+
+from ui.data import ROLE_LABELS
 
 
 ROLE_COLORS = {
@@ -27,6 +28,7 @@ class GraphSubset:
     edges: pd.DataFrame
     hidden_edges: int
     mode: str
+    hidden_nodes: int = 0
 
 
 def build_subgraph(
@@ -36,9 +38,12 @@ def build_subgraph(
     *,
     mode: str = "neighborhood",
     max_edges: int = 24,
+    max_nodes: int = 40,
 ) -> GraphSubset:
     """Select observed edges only, preserving the original ``src → dst`` direction."""
 
+    if mode not in {"neighborhood", "cluster"} or max_edges < 1 or max_nodes < 1:
+        raise ValueError("Invalid graph mode or limit.")
     selected_rows = nodes_roles.loc[nodes_roles["_gid_key"] == selected_gid]
     if selected_rows.empty:
         raise ValueError("Selected gid is absent from the graph data.")
@@ -54,13 +59,25 @@ def build_subgraph(
         candidates = edges.loc[
             (edges["_src_key"] == selected_gid) | (edges["_dst_key"] == selected_gid)
         ]
+        node_keys = {selected_gid} | set(candidates["_src_key"]) | set(candidates["_dst_key"])
 
-    ordered = candidates.assign(_amount=pd.to_numeric(candidates["sum_kzt"], errors="coerce").fillna(0))
+    ordered = candidates.assign(_amount=candidates["sum_kzt"], _src_order=candidates["_src_key"].map(int), _dst_order=candidates["_dst_key"].map(int))
     ordered = ordered.sort_values(
-        ["_amount", "_src_key", "_dst_key"], ascending=[False, True, True], kind="stable"
+        ["_amount", "_src_order", "_dst_order"], ascending=[False, True, True], kind="stable"
     )
-    visible_edges = ordered.head(max_edges).drop(columns="_amount")
-    visible_keys = {selected_gid} | set(visible_edges["_src_key"]) | set(visible_edges["_dst_key"])
+    # Always preserve selection. Prefer largest observed edges, respecting both
+    # limits; then add remaining cluster members, including isolated vertices.
+    visible_keys = {selected_gid}
+    edge_indices = []
+    for index, row in ordered.iterrows():
+        keys = {row["_src_key"], row["_dst_key"]}
+        if len(edge_indices) < max_edges and len(visible_keys | keys) <= max_nodes:
+            visible_keys |= keys
+            edge_indices.append(index)
+    for key in sorted(node_keys, key=int):
+        if len(visible_keys) < max_nodes:
+            visible_keys.add(key)
+    visible_edges = candidates.loc[edge_indices].copy()
     visible_nodes = nodes_roles.loc[nodes_roles["_gid_key"].isin(visible_keys)].copy()
     visible_nodes = visible_nodes.sort_values("_gid_key", kind="stable")
     return GraphSubset(
@@ -68,12 +85,14 @@ def build_subgraph(
         edges=visible_edges,
         hidden_edges=max(len(candidates) - len(visible_edges), 0),
         mode=mode,
+        hidden_nodes=len(node_keys - visible_keys),
     )
 
 
-def _cluster_color(cluster_id: object) -> str:
-    digest = hashlib.sha256(str(cluster_id).encode("utf-8")).digest()[0]
-    return CLUSTER_COLORS[digest % len(CLUSTER_COLORS)]
+def cluster_color(cluster_id: object) -> str:
+    # Stable for integer IDs and shared with the website. A palette can repeat;
+    # the legend always includes cluster IDs, never implies globally unique hues.
+    return CLUSTER_COLORS[int(cluster_id) % len(CLUSTER_COLORS)]
 
 
 def _format_amount(value: object) -> str:
@@ -81,11 +100,6 @@ def _format_amount(value: object) -> str:
         return f"{float(value):,.2f}".replace(",", "\u202f") + " KZT"
     except (TypeError, ValueError):
         return "сумма не указана"
-
-
-def _short_gid(gid: object, max_length: int = 16) -> str:
-    value = str(gid)
-    return value if len(value) <= max_length else f"{value[:7]}…{value[-6:]}"
 
 
 def render_svg(subgraph: GraphSubset, selected_gid: str, *, color_by: str = "role") -> str:
@@ -112,6 +126,7 @@ def render_svg(subgraph: GraphSubset, selected_gid: str, *, color_by: str = "rol
         '<rect width="100%" height="100%" rx="12" fill="#f8fafc"/>',
     ]
 
+    pairs = set(zip(subgraph.edges["_src_key"], subgraph.edges["_dst_key"]))
     for _, edge in subgraph.edges.iterrows():
         source, target = str(edge["_src_key"]), str(edge["_dst_key"])
         if source not in positions or target not in positions:
@@ -122,31 +137,49 @@ def render_svg(subgraph: GraphSubset, selected_gid: str, *, color_by: str = "rol
         start_x, start_y = x1 + radius * (x2 - x1) / distance, y1 + radius * (y2 - y1) / distance
         end_x, end_y = x2 - (radius + 6) * (x2 - x1) / distance, y2 - (radius + 6) * (y2 - y1) / distance
         title = html.escape(f"{source} → {target}; {_format_amount(edge['sum_kzt'])}; операций: {edge['n_tx']}")
-        parts.append(
-            f'<line x1="{start_x:.1f}" y1="{start_y:.1f}" x2="{end_x:.1f}" y2="{end_y:.1f}" '
-            f'stroke="#475569" stroke-width="2" marker-end="url(#arrow)"><title>{title}</title></line>'
-        )
+        if source == target:
+            path = f"M {x1-18:.1f} {y1-23:.1f} C {x1-80:.1f} {y1-105:.1f}, {x1+80:.1f} {y1-105:.1f}, {x1+20:.1f} {y1-28:.1f}"
+        elif (target, source) in pairs:
+            cx = (x1+x2)/2 - 38*(y2-y1)/distance
+            cy = (y1+y2)/2 + 38*(x2-x1)/distance
+            path = f"M {start_x:.1f} {start_y:.1f} Q {cx:.1f} {cy:.1f}, {end_x:.1f} {end_y:.1f}"
+        else:
+            path = f"M {start_x:.1f} {start_y:.1f} L {end_x:.1f} {end_y:.1f}"
+        parts.append(f'<path d="{path}" data-src="{html.escape(source)}" data-dst="{html.escape(target)}" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"><title>{title}</title></path>')
 
     for _, row in nodes.iterrows():
         gid = str(row["_gid_key"])
         x, y = positions[gid]
-        color = _cluster_color(row["cluster_id"]) if color_by == "cluster" else ROLE_COLORS.get(row["role"], "#64748b")
+        color = cluster_color(row["cluster_id"]) if color_by == "cluster" else ROLE_COLORS.get(row["role"], "#64748b")
         selected = gid == selected_gid
         seed = bool(row["is_seed"])
         stroke = "#0f172a" if selected else ("#facc15" if seed else "#ffffff")
         stroke_width = 5 if selected else 3
         dash = " stroke-dasharray=\"5 3\"" if seed and not selected else ""
         title = html.escape(
-            f"gid: {gid}\nРоль: {row['role']}\nКластер: {row['cluster_id']}\n"
+            f"gid: {gid}\nРоль: {ROLE_LABELS[row['role']]} ({row['role']})\nКластер: {row['cluster_id']}\n"
             f"depth: {row['depth']}; seed: {'да' if seed else 'нет'}"
         )
-        label = html.escape(_short_gid(gid))
+        label = html.escape(gid)
+        if seed:
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius+7}" fill="none" stroke="#b8860b" stroke-width="2" stroke-dasharray="5 3"/>')
         parts.extend(
             [
                 f'<g><title>{title}</title><circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" stroke="{stroke}" stroke-width="{stroke_width}"{dash}/>',
-                f'<text x="{x:.1f}" y="{y + 4:.1f}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="white">{label}</text></g>',
+                f'<text x="{x:.1f}" y="{y + radius + 22:.1f}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#142229">{label}</text></g>',
             ]
         )
 
     parts.append("</svg>")
     return "".join(parts)
+
+
+def render_legend(subgraph: GraphSubset, color_by: str) -> str:
+    if color_by == "cluster":
+        items = [(cluster_color(key), f"Кластер {key}") for key in sorted(set(subgraph.nodes["_cluster_key"]), key=int)]
+    else:
+        items = [(ROLE_COLORS[role], ROLE_LABELS[role]) for role in ROLE_COLORS if role in set(subgraph.nodes["role"])]
+    return '<div style="display:flex;flex-wrap:wrap;gap:12px">' + "".join(
+        f'<span><i style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{color}"></i> {html.escape(label)}</span>'
+        for color, label in items
+    ) + "</div>"

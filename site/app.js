@@ -1,36 +1,14 @@
-(() => {
+import { roles, canonicalGid, rankNodes, csvFor, selectGraph, edgePath, clusterColor } from "./model.mjs";
+
+(async () => {
   "use strict";
 
-  const roles = {
-    consolidator: { label: "Признаки консолидации", color: "#2563eb" },
-    transit: { label: "Признаки транзита", color: "#7c3aed" },
-    distributor: { label: "Признаки распределения", color: "#ea580c" },
-    terminal: { label: "Предполагаемый конечный получатель", color: "#059669" },
-    coordinator: { label: "Структурный кандидат на координацию", color: "#be123c" },
-    peripheral: { label: "Недостаточно выраженные признаки", color: "#64748b" },
-  };
-
-  const nodes = [
-    { gid: "9007199254740993", depth: 0, isSeed: true, role: "coordinator", roleScore: .73, priority: .82, cluster: 1, evidence: "Синтетический пример: стартовый узел с наблюдаемыми исходящими связями." },
-    { gid: "10000000000000002", depth: 1, isSeed: false, role: "consolidator", roleScore: .86, priority: .94, cluster: 1, evidence: "Синтетический пример: несколько входящих и исходящих контрагентов." },
-    { gid: "10000000000000003", depth: 2, isSeed: false, role: "transit", roleScore: .77, priority: .88, cluster: 1, evidence: "Синтетический пример: входящий и исходящий поток в окружении." },
-    { gid: "10000000000000004", depth: 3, isSeed: false, role: "distributor", roleScore: .68, priority: .74, cluster: 1, evidence: "Синтетический пример: один источник и несколько направлений проверки." },
-    { gid: "10000000000000005", depth: 4, isSeed: false, role: "terminal", roleScore: .81, priority: .79, cluster: 1, evidence: "Синтетический пример: узел на границе глубины выборки." },
-    { gid: "10000000000000006", depth: 2, isSeed: false, role: "peripheral", roleScore: .22, priority: .31, cluster: 1, evidence: "Синтетический пример: малое наблюдаемое окружение." },
-    { gid: "10000000000000007", depth: 1, isSeed: false, role: "peripheral", roleScore: .05, priority: .08, cluster: 2, evidence: "Синтетический пример: изолированный узел без наблюдаемых связей." },
-  ];
-  const edges = [
-    { src: "9007199254740993", dst: "10000000000000002", sum: 125000, nTx: 4 },
-    { src: "10000000000000002", dst: "10000000000000003", sum: 82000, nTx: 2 },
-    { src: "10000000000000002", dst: "10000000000000004", sum: 39000, nTx: 1 },
-    { src: "10000000000000003", dst: "10000000000000005", sum: 76000, nTx: 3 },
-    { src: "10000000000000006", dst: "10000000000000002", sum: 15000, nTx: 1 },
-  ];
-  const clusters = [
-    { id: 1, nNodes: 6, nSeed: 1, sum: 337000, topGids: ["10000000000000002", "10000000000000003", "9007199254740993"], hypothesis: "Синтетическая группа со связанными переводами; не является результатом анализа." },
-    { id: 2, nNodes: 1, nSeed: 0, sum: 0, topGids: ["10000000000000007"], hypothesis: "Синтетический изолят без наблюдаемых связей." },
-  ];
-  const top = [...nodes].sort((a, b) => b.priority - a.priority || a.gid.localeCompare(b.gid)).map((node, index) => ({ ...node, rank: index + 1 }));
+  const response = await fetch(new URL("./demo-data.json", import.meta.url));
+  if (!response.ok) throw new Error("Не удалось загрузить синтетический набор.");
+  const sample = await response.json();
+  if (sample.synthetic !== true) throw new Error("Ожидался явно синтетический набор.");
+  const { nodes, edges, clusters } = sample;
+  const top = rankNodes(nodes);
   let selectedGid = top[0].gid;
 
   const $ = (selector) => document.querySelector(selector);
@@ -40,11 +18,6 @@
   const clusterFilter = $("#cluster-filter");
   const number = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
 
-  const canonicalGid = (value) => {
-    const trimmed = String(value).trim();
-    if (!/^[+-]?\d+$/.test(trimmed)) return null;
-    return BigInt(trimmed).toString();
-  };
   const formatKzt = (value) => `${number.format(value)} KZT`;
   const nodeFor = (gid) => nodes.find((node) => node.gid === gid);
   const create = (tag, text, className) => {
@@ -76,6 +49,11 @@
     $("#top-count").textContent = `${filtered.length} из ${top.length}`;
     const table = $("#top-table");
     table.replaceChildren();
+    if (!filtered.length) {
+      const empty = create("tr");
+      const cell = create("td", "По текущему фильтру строк нет. Поиск по полному набору доступен.");
+      cell.colSpan = 5; empty.append(cell); table.append(empty);
+    }
     filtered.forEach((node) => {
       const row = create("tr");
       if (node.gid === selectedGid) row.classList.add("selected");
@@ -91,10 +69,13 @@
       roleCell.append(roleLabel);
       row.append(roleCell);
       row.append(create("td", node.priority.toFixed(2)));
+      row.append(create("td", node.evidence));
       row.addEventListener("click", () => selectNode(node.gid, "Узел выбран из глобального топа."));
       row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectNode(node.gid, "Узел выбран из глобального топа."); } });
       table.append(row);
     });
+    const hidden = !filtered.some(node => node.gid === selectedGid);
+    $("#top-count").textContent += hidden ? " · выбранный gid вне фильтра; карточка доступна" : "";
   }
 
   function renderCase() {
@@ -113,7 +94,10 @@
     const nextSteps = [];
     if (node.depth === 4) { restrictions.push("Выборка обрывается на четвёртом колене."); nextSteps.push("Запросить последующие исходящие операции за пределами глубины текущей выгрузки."); }
     if (node.isSeed) { restrictions.push("Входящие операции до начала выборки могут быть неполными."); nextSteps.push("Уточнить входящие операции, предшествующие текущей выборке."); }
-    if (!incoming.length && !outgoing.length) restrictions.push("Наблюдаемых связей нет; это не ошибка визуализации.");
+    if (!incoming.length && !outgoing.length) {
+      restrictions.push("Наблюдаемых связей нет.");
+      nextSteps.push("Уточнить полноту выгрузки и наличие операций вне наблюдаемого периода.");
+    }
     if (node.role === "transit") nextSteps.push("Сопоставить даты доступных входящих и исходящих операций до вывода о последовательности потоков.");
     if (!nextSteps.length) nextSteps.push("Проверить показанные операции и принять решение об углублённой проверке у специалиста.");
     $("#next-step").textContent = `${restrictions.join(" ")} ${nextSteps.join(" ")}`.trim();
@@ -151,14 +135,17 @@
     holder.append(create("strong", `Кластер ${cluster.id}`));
     holder.append(create("p", `${cluster.nNodes} узлов · ${cluster.nSeed} seed · внутренний оборот ${formatKzt(cluster.sum)}`));
     holder.append(create("p", cluster.hypothesis));
-    holder.append(create("p", `top_gids: ${cluster.topGids.join(", ")}`));
+    cluster.topGids.forEach(gid => {
+      const button = create("button", gid, "button button-secondary");
+      button.addEventListener("click", () => selectNode(gid, `Открыт gid ${gid} из кластера.`));
+      holder.append(button);
+    });
   }
 
   function renderGraph() {
-    const selected = nodeFor(selectedGid);
-    const visibleEdges = edges.filter((edge) => edge.src === selectedGid || edge.dst === selectedGid);
-    const visibleIds = [...new Set([selectedGid, ...visibleEdges.flatMap((edge) => [edge.src, edge.dst])])];
-    const graphNodes = visibleIds.map(nodeFor).filter(Boolean);
+    const { nodes: graphNodes, edges: visibleEdges } = selectGraph(nodes, edges, selectedGid, $("#graph-mode").value);
+    const colorBy = $("#graph-color").value;
+    const color = node => colorBy === "role" ? roles[node.role].color : clusterColor(node.cluster);
     const svg = $("#network");
     svg.replaceChildren();
     const ns = "http://www.w3.org/2000/svg";
@@ -178,21 +165,35 @@
     });
     visibleEdges.forEach((edge) => {
       const [x1, y1] = positions.get(edge.src); const [x2, y2] = positions.get(edge.dst);
-      const distance = Math.hypot(x2 - x1, y2 - y1) || 1; const radius = 31;
-      const line = svgElement("line", { x1: x1 + radius * (x2 - x1) / distance, y1: y1 + radius * (y2 - y1) / distance, x2: x2 - (radius + 7) * (x2 - x1) / distance, y2: y2 - (radius + 7) * (y2 - y1) / distance, stroke: "#627278", "stroke-width": 2, "marker-end": "url(#arrow)" });
+      const reciprocal = visibleEdges.some(other => other.src === edge.dst && other.dst === edge.src);
+      const line = svgElement("path", { d: edgePath(edge.src, edge.dst, [x1,y1], [x2,y2], reciprocal), fill: "none", stroke: "#627278", "stroke-width": 2, "marker-end": "url(#arrow)" });
       line.append(createSvgTitle(`${edge.src} → ${edge.dst}; ${formatKzt(edge.sum)}; операций: ${edge.nTx}`)); svg.append(line);
     });
     graphNodes.forEach((node) => {
       const [x, y] = positions.get(node.gid); const group = svgElement("g");
-      const circle = svgElement("circle", { cx: x, cy: y, r: node.gid === selectedGid ? 32 : 29, fill: roles[node.role].color, stroke: node.gid === selectedGid ? "#142229" : node.isSeed ? "#f7bc22" : "#fff", "stroke-width": node.gid === selectedGid ? 5 : 3 });
-      if (node.isSeed && node.gid !== selectedGid) circle.setAttribute("stroke-dasharray", "5 3");
+      const circle = svgElement("circle", { cx: x, cy: y, r: node.gid === selectedGid ? 32 : 29, fill: color(node), stroke: node.gid === selectedGid ? "#142229" : "#fff", "stroke-width": node.gid === selectedGid ? 5 : 3 });
+      if (node.isSeed) group.append(svgElement("circle", { cx:x, cy:y, r:39, fill:"none", stroke:"#b8860b", "stroke-width":2, "stroke-dasharray":"5 3" }));
       group.append(createSvgTitle(`gid: ${node.gid}\nРоль: ${roles[node.role].label}\nКластер: ${node.cluster}\ndepth: ${node.depth}; seed: ${node.isSeed ? "да" : "нет"}`));
       group.append(circle);
-      const label = svgElement("text", { x, y: y + 4, "text-anchor": "middle", fill: "#fff", "font-size": 10, "font-family": "system-ui, sans-serif" });
-      label.textContent = node.gid.length > 16 ? `${node.gid.slice(0, 7)}…${node.gid.slice(-6)}` : node.gid;
+      const label = svgElement("text", { x, y: y + 55, "text-anchor": "middle", fill: "#142229", "font-size": 12, "font-family": "system-ui, sans-serif" });
+      label.textContent = node.gid;
+      group.setAttribute("role", "button"); group.setAttribute("tabindex", "0");
+      group.setAttribute("aria-label", `Открыть gid ${node.gid}`);
+      group.addEventListener("click", () => selectNode(node.gid, "Узел выбран на графе."));
+      group.addEventListener("keydown", event => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); selectNode(node.gid, "Узел выбран на графе."); } });
       group.append(label); svg.append(group);
     });
-    $("#graph-caption").textContent = visibleEdges.length ? `Показано ${graphNodes.length} узлов и ${visibleEdges.length} наблюдаемых рёбер. Полные gid доступны в карточке и таблицах.` : "Наблюдаемых связей нет: показан сам найденный узел.";
+    $("#graph-caption").textContent = `Показано ${graphNodes.length} узлов и ${visibleEdges.length} наблюдаемых рёбер. Полные gid доступны в карточке и таблицах.`;
+    const legend = $("#color-legend"); legend.replaceChildren();
+    const keys = new Set();
+    graphNodes.forEach(node => {
+      const key = colorBy === "role" ? node.role : node.cluster;
+      if (keys.has(key)) return; keys.add(key);
+      const item = create("span");
+      const dot = create("i"); dot.style.background = color(node);
+      item.append(dot, document.createTextNode(colorBy === "role" ? roles[node.role].label : `Кластер ${node.cluster}`));
+      legend.append(item);
+    });
   }
 
   function createSvgTitle(text) { const title = document.createElementNS("http://www.w3.org/2000/svg", "title"); title.textContent = text; return title; }
@@ -204,17 +205,11 @@
     renderAll();
   }
 
-  function csvFor(kind) {
-    if (kind === "nodes_roles") return ["gid,role,role_score,cluster_id,priority_score,evidence", ...nodes.map((node) => [node.gid, node.role, node.roleScore, node.cluster, node.priority, `"${node.evidence}"`].join(","))].join("\n");
-    if (kind === "clusters") return ["cluster_id,n_nodes,n_seed,sum_kzt_internal,top_gids,hypothesis", ...clusters.map((cluster) => [cluster.id, cluster.nNodes, cluster.nSeed, cluster.sum, `"${JSON.stringify(cluster.topGids).replaceAll('"', '""')}"`, `"${cluster.hypothesis}"`].join(","))].join("\n");
-    return ["rank,gid,role,priority_score,why", ...top.map((node) => [node.rank, node.gid, node.role, node.priority, `"${node.evidence}"`].join(","))].join("\n");
-  }
-
   function download(kind) {
-    const blob = new Blob([csvFor(kind)], { type: "text/csv;charset=utf-8" });
+    const blob = new Blob([csvFor(kind, nodes, clusters)], { type: "text/csv;charset=utf-8" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob); link.download = `${kind}.csv`; link.click();
-    URL.revokeObjectURL(link.href);
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   }
 
   function renderAll() { renderTop(); renderCase(); renderGraph(); }
@@ -227,7 +222,14 @@
   gidSearch.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); $("#search-button").click(); } });
   roleFilter.addEventListener("change", renderTop);
   clusterFilter.addEventListener("change", renderTop);
+  $("#graph-mode").addEventListener("change", renderGraph);
+  $("#graph-color").addEventListener("change", renderGraph);
   document.querySelectorAll("[data-download]").forEach((button) => button.addEventListener("click", () => download(button.dataset.download)));
 
   populateFilters(); renderStats(); renderAll();
-})();
+})().catch((error) => {
+  const status = document.querySelector("#search-message");
+  status.textContent = error.message + " Обновите страницу после проверки файлов сайта.";
+  status.classList.add("error");
+  document.querySelector("#search-button").disabled = true;
+});

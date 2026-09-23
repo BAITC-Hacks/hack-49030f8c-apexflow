@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ui.data import (
     ROLE_LABELS,
@@ -22,11 +24,12 @@ from ui.data import (
     parse_gid,
     synthetic_view_data,
 )
-from ui.graph import build_subgraph, render_svg
+from ui.graph import build_subgraph, render_svg, render_legend
 
 
-DEFAULT_DATA_DIR = os.environ.get("APEXFLOW_DATA_DIR", "/app/data")
-DEFAULT_OUTPUT_DIR = os.environ.get("APEXFLOW_OUTPUT_DIR", "/app/output")
+APP_ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = os.environ.get("APEXFLOW_DATA_DIR", str(APP_ROOT / "data"))
+DEFAULT_OUTPUT_DIR = os.environ.get("APEXFLOW_OUTPUT_DIR", str(APP_ROOT / "output"))
 
 
 @st.cache_data(show_spinner=False)
@@ -100,8 +103,9 @@ def _load_selected_data(use_synthetic: bool) -> ViewData | None:
         st.error("Результаты расчёта пока недоступны или не проходят проверку данных.")
         st.code(str(error), language=None)
         st.info(
-            "После настройки Docker запустите подтверждённый командой pipeline сценарий. "
-            "Интерфейс не подменяет отсутствующие результаты синтетическим набором."
+            "Дождитесь успешного pipeline и обновите данные. "
+            "Повторный расчёт: docker compose down, затем docker compose up --build --force-recreate. "
+            "Для расчёта нужны исходные Parquet и интегрированный модуль аналитики."
         )
         return None
 
@@ -148,6 +152,8 @@ def _render_top(data: ViewData, selected_gid: str, role_filter: str, cluster_fil
         }
     )
     st.dataframe(visible, hide_index=True, use_container_width=True)
+    if selected_gid not in set(top["_gid_key"]):
+        st.info("Выбранный gid отсутствует в показанной части топа. Карточка и граф ниже доступны по полному набору.")
     if top.empty:
         st.info("По текущему фильтру нет строк. Поиск по полному набору всё равно доступен.")
         return
@@ -162,10 +168,6 @@ def _render_top(data: ViewData, selected_gid: str, role_filter: str, cluster_fil
     if st.button("Показать выбранный узел", key="open_top"):
         _set_selected_gid(chosen)
         st.rerun()
-    if selected_gid not in set(top["_gid_key"].astype(str)):
-        st.info(
-            "Карточка ниже выбрана поиском по полному набору и не обязана соответствовать текущему фильтру топа."
-        )
 
 
 def _render_node_card(data: ViewData, node: pd.Series) -> None:
@@ -181,7 +183,7 @@ def _render_node_card(data: ViewData, node: pd.Series) -> None:
         "Ни одна из шкал не является вероятностью виновности."
     )
     st.markdown("**Объяснение из расчёта**")
-    st.write(str(node["evidence"]))
+    st.text(str(node["evidence"]))
     st.markdown(
         f"depth: **{node['depth']}** · is_seed: **{_bool_label(node['is_seed'])}**"
     )
@@ -189,10 +191,13 @@ def _render_node_card(data: ViewData, node: pd.Series) -> None:
     selected_gid = str(node["_gid_key"])
     inbound = data.edges.loc[data.edges["_dst_key"] == selected_gid]
     outbound = data.edges.loc[data.edges["_src_key"] == selected_gid]
+    payers = inbound.loc[inbound["_src_key"] != selected_gid, "_src_key"].nunique()
+    recipients = outbound.loc[outbound["_dst_key"] != selected_gid, "_dst_key"].nunique()
     st.markdown(
         "**Наблюдаемые связи:** "
-        f"{len(inbound)} входящих на {_format_kzt(inbound['sum_kzt'].sum())}; "
-        f"{len(outbound)} исходящих на {_format_kzt(outbound['sum_kzt'].sum())}."
+        f"{payers} внешних плательщиков, вход {_format_kzt(inbound['sum_kzt'].sum())}; "
+        f"{recipients} внешних получателей, выход {_format_kzt(outbound['sum_kzt'].sum())}. "
+        "Переводы самому себе включены в суммы, но не в число внешних контрагентов."
     )
 
     limitations: list[str] = []
@@ -207,6 +212,7 @@ def _render_node_card(data: ViewData, node: pd.Series) -> None:
         steps.append("Уточнить входящие операции, предшествующие текущей выборке.")
     if inbound.empty and outbound.empty:
         limitations.append("Наблюдаемых связей нет; это не является ошибкой визуализации.")
+        steps.append("Уточнить полноту выгрузки и наличие операций вне наблюдаемого периода.")
     if node["role"] == "transit":
         steps.append("Сопоставить даты доступных входящих и исходящих операций перед выводом о последовательности потоков.")
     if not steps:
@@ -254,19 +260,17 @@ def _render_graph(data: ViewData, selected_gid: str) -> None:
         edge_limit = st.slider("Макс. рёбер", min_value=5, max_value=40, value=24, step=1)
     subset = build_subgraph(data.nodes_roles, data.edges, selected_gid, mode=graph_mode, max_edges=edge_limit)
     st.caption(
-        f"Показано {len(subset.nodes)} узлов и {len(subset.edges)} наблюдаемых рёбер. "
-        + (f"Скрыто по лимиту: {subset.hidden_edges} рёбер." if subset.hidden_edges else "")
+        f"Показано узлов: {len(subset.nodes)}, рёбер: {len(subset.edges)}. "
+        f"Скрыто по лимитам: {subset.hidden_nodes} узлов, {subset.hidden_edges} рёбер. "
+        "При ограничении выбираются крупнейшие переводы; полный список связей доступен ниже."
     )
-    if subset.edges.empty:
-        st.info("Наблюдаемых связей нет: показан сам найденный узел.")
-    st.components.v1.html(render_svg(subset, selected_gid, color_by=color_by), height=550, scrolling=True)
-    if color_by == "role":
-        legend = " · ".join(
-            f"{label} ({code})" for code, label in ROLE_LABELS.items()
-        )
-        st.caption("Легенда ролей: " + legend + ". Выбранный узел выделен тёмной рамкой; seed — жёлтой.")
-    else:
-        st.caption("Каждый кластер окрашен своим стабильным цветом; выбранный узел выделен тёмной рамкой.")
+    if subset.edges.empty and subset.hidden_edges:
+        st.info("Лимиты скрыли все рёбра; увеличьте пределы для просмотра наблюдаемых связей.")
+    elif subset.edges.empty:
+        st.info(f"Наблюдаемых связей нет в этой области: показано узлов — {len(subset.nodes)}.")
+    components.html(render_svg(subset, selected_gid, color_by=color_by), height=400, scrolling=True)
+    st.markdown(render_legend(subset, color_by), unsafe_allow_html=True)
+    st.caption("Тёмная рамка — выбранный узел; внешняя пунктирная рамка — seed. В подсказке указан depth. Цвета кластеров могут повторяться: сверяйте номер.")
 
 
 def _render_clusters_and_downloads(data: ViewData) -> None:
@@ -292,7 +296,10 @@ def _render_clusters_and_downloads(data: ViewData) -> None:
     cluster = data.clusters.loc[data.clusters["_cluster_key"] == selected_cluster].iloc[0]
     gids = _parse_top_gids(cluster["top_gids"])
     if gids:
-        st.caption("Узлы из top_gids: " + ", ".join(gids) + ". Их можно открыть через поиск по gid.")
+        cluster_gid = st.selectbox("Открыть gid кластера", options=gids)
+        if st.button("Открыть карточку узла кластера"):
+            _set_selected_gid(cluster_gid)
+            st.rerun()
     else:
         st.warning("top_gids в выбранном кластере не удалось прочитать как JSON-массив целых gid.")
 
