@@ -10,9 +10,18 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
+from apexflow.io import INPUT_FILES, OUTPUT_COLUMNS, file_hashes, write_run_manifest
 
 from ui.data import ViewDataError, find_node, parse_gid, synthetic_view_data, load_view_data, file_signature
 from ui.graph import build_subgraph, render_svg
+
+
+def _complete_manifest(data_dir, output):
+    write_run_manifest(output, {
+        "schema_version": 1, "status": "complete",
+        "inputs": file_hashes(data_dir, INPUT_FILES.values()),
+        "outputs": file_hashes(output, [f"{name}.csv" for name in OUTPUT_COLUMNS]),
+    })
 
 
 class UiDataTests(unittest.TestCase):
@@ -66,8 +75,14 @@ def disk_sample(tmp_path):
         edges[column] = edges[column].map(int).astype("int64")
     nodes.to_parquet(data_dir / "nodes.parquet", index=False)
     edges.to_parquet(data_dir / "edges.parquet", index=False)
+    pd.DataFrame([
+        {"src": int(row.src), "dst": int(row.dst), "sum_kzt": row.sum_kzt / row.n_tx,
+         "date": pd.Timestamp("2026-07-01")}
+        for row in edges.itertuples() for _ in range(row.n_tx)
+    ]).to_parquet(data_dir / "transactions.parquet", index=False)
     for filename, payload in data.raw_csv.items():
         (output / filename).write_bytes(payload)
+    _complete_manifest(data_dir, output)
     return data_dir, output
 
 
@@ -107,6 +122,7 @@ def test_ui_rejects_corrupt_results(disk_sample, table, column, value):
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
     frame.loc[0, column] = str(value)
     frame.to_csv(path, index=False)
+    _complete_manifest(data_dir, output)
     with pytest.raises(ViewDataError):
         load_view_data(data_dir, output)
 
@@ -117,6 +133,7 @@ def test_strings_are_not_treated_as_true_seed(disk_sample):
     frame = pd.read_parquet(path)
     frame["is_seed"] = "False"
     frame.to_parquet(path, index=False)
+    _complete_manifest(data_dir, output)
     with pytest.raises(ViewDataError, match="bool"):
         load_view_data(data_dir, output)
 
@@ -136,6 +153,7 @@ def test_refresh_signature_and_content_change(disk_sample):
     frame = pd.read_csv(path, dtype=str)
     frame.loc[0, "evidence"] = "Обновлено: 1 наблюдаемый перевод."
     frame.to_csv(path, index=False)
+    _complete_manifest(data_dir, output)
     assert before != file_signature(data_dir, output)
     assert load_view_data(data_dir, output).nodes_roles.iloc[0]["evidence"] == frame.loc[0, "evidence"]
 
@@ -184,3 +202,84 @@ def test_streamlit_search_survives_filter_and_missing_files(tmp_path, monkeypatc
     next(button for button in app.button if button.label == "Найти клиента").click().run()
     assert not app.exception
     assert len(app.error) == 1
+
+
+@pytest.mark.parametrize("filename", ["transactions.parquet", "nodes_roles.csv"])
+def test_ui_rejects_modified_snapshot_even_if_schema_is_valid(disk_sample, filename):
+    data_dir, output = disk_sample
+    if filename.endswith("parquet"):
+        path = data_dir / filename
+        frame = pd.read_parquet(path)
+        frame["date"] += pd.Timedelta(days=1)
+        frame.to_parquet(path, index=False)
+    else:
+        path = output / filename
+        frame = pd.read_csv(path, dtype=str)
+        frame.loc[0, "evidence"] = "Правдоподобное, но чужое объяснение."
+        frame.to_csv(path, index=False)
+    with pytest.raises(ViewDataError, match="изменились"):
+        load_view_data(data_dir, output)
+
+
+def test_streamlit_rejects_failed_run_after_successful_cached_load(disk_sample, monkeypatch):
+    data_dir, output = disk_sample
+    monkeypatch.setenv("APEXFLOW_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("APEXFLOW_OUTPUT_DIR", str(output))
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=20)
+    assert not app.exception and not app.error
+    assert any("01.07.2026 — 01.07.2026" in item.value for item in app.caption)
+    write_run_manifest(output, {"schema_version": 1, "status": "failed"})
+    app.run()
+    assert not app.exception
+    assert len(app.error) == 1
+    assert not app.dataframe  # Previous successful results are no longer shown.
+
+
+def test_streamlit_cluster_card_follows_search_and_boundary_warning(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFLOW_DATA_DIR", str(tmp_path / "absent"))
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=20)
+    app.toggle[0].set_value(True).run()
+    app.text_input[0].set_value("10000000000000007")
+    next(button for button in app.button if button.label == "Найти клиента").click().run()
+    assert not app.exception
+    assert any("Кластер выбранного клиента: 2" in item.value for item in app.markdown)
+    assert next(item for item in app.metric if item.label == "Узлов в выбранном кластере").value == "1"
+    boundary = synthetic_view_data().nodes_roles.query("depth == 4").iloc[0]["gid"]
+    app.text_input[0].set_value(boundary)
+    next(button for button in app.button if button.label == "Найти клиента").click().run()
+    assert not app.exception
+    assert any("четвёртом колене" in item.value for item in app.warning)
+    assert any("Кластер выбранного клиента: 1" in item.value for item in app.markdown)
+
+
+def test_card_large_int64_money_does_not_wrap_negative():
+    data = synthetic_view_data()
+    gid = "10000000000000002"
+    data.edges["sum_kzt"] = 0
+    inbound = data.edges.index[data.edges["_dst_key"] == gid][:2]
+    assert len(inbound) == 2
+    data.edges.loc[inbound, "sum_kzt"] = 2**62
+    from app import _render_node_card
+    with patch("app.st") as display:
+        display.columns.return_value = [display, display, display]
+        _render_node_card(data, find_node(data, gid))
+    observed = next(call.args[0] for call in display.markdown.call_args_list if "Наблюдаемые связи" in call.args[0])
+    assert "9\u202f223\u202f372\u202f036\u202f854\u202f775\u202f808.00 KZT" in observed
+    assert "-9" not in observed
+
+
+def test_demo_examples_are_selected_from_current_data_and_keep_exact_edges():
+    from ui.demo_examples import select_examples
+    data = synthetic_view_data()
+    examples = select_examples(data)
+    assert len(examples) == 3
+    assert not examples[0]["is_seed"]
+    assert examples[0]["role"] != examples[1]["role"]
+    assert examples[2]["depth"] == 4
+    for example in examples:
+        assert example["evidence"] == find_node(data, example["gid"])["evidence"]
+        edge = example["edge_to_verify"]
+        if edge is not None:
+            observed = data.edges.loc[(data.edges["src"] == edge["src"]) & (data.edges["dst"] == edge["dst"])].iloc[0]
+            assert edge["sum_kzt"] == observed["sum_kzt"]
+            assert edge["n_tx"] == observed["n_tx"]
