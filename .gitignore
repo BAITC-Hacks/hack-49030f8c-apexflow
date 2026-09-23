@@ -13,3 +13,4 @@ output/
 /top_nodes.csv
 *.parquet
 .ci/
+.DS_Store

@@ -115,6 +115,27 @@ def test_integer_turnover_cannot_overflow_during_reconciliation():
     validate_outputs(results, nodes, edges)
 
 
+@pytest.mark.parametrize("offset", [1, -1])
+def test_adjacent_large_integer_amounts_cannot_reconcile_as_equal(offset):
+    nodes, edges, transactions = sample_inputs(2)
+    edges["sum_kzt"] = pd.Series([2**53], dtype="int64")
+    transactions["sum_kzt"] = pd.Series([2**53 + offset], dtype="int64")
+    with pytest.raises(ValueError, match="агрегированными"):
+        validate_inputs(nodes, edges, transactions)
+
+
+def test_large_integer_reconciliation_keeps_small_transactions():
+    nodes, edges, transactions = sample_inputs(2)
+    transactions = pd.concat([transactions, transactions], ignore_index=True)
+    transactions["sum_kzt"] = pd.Series([2**53, 1], dtype="int64")
+    edges["sum_kzt"] = pd.Series([2**53 + 1], dtype="int64")
+    edges["n_tx"] = 2
+    validate_inputs(nodes, edges, transactions)
+    edges["sum_kzt"] = 2**53
+    with pytest.raises(ValueError, match="агрегированными"):
+        validate_inputs(nodes, edges, transactions)
+
+
 def test_large_turnover_tolerance_is_roundoff_not_percentage():
     nodes, edges, transactions = sample_inputs(2)
     transactions["sum_kzt"] = 1e15

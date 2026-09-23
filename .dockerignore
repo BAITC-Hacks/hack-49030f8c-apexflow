@@ -21,3 +21,4 @@ top_nodes.csv
 *.pdf
 docs
 .ci
+.DS_Store

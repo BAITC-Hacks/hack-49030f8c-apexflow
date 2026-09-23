@@ -168,7 +168,19 @@ def _validate_aggregation(edges: pd.DataFrame, transactions: pd.DataFrame) -> No
         raise ValueError("Пары edges и агрегированные transactions не совпадают")
     if not (merged["n_tx_edge"] == merged["n_tx_tx"]).all():
         raise ValueError("n_tx в edges не совпадает с количеством transactions")
-    if not all(_same_money(edge, tx) for edge, tx in zip(merged["sum_kzt_edge"], merged["sum_kzt_tx"])):
+    if pd.api.types.is_integer_dtype(edges["sum_kzt"]) and pd.api.types.is_integer_dtype(transactions["sum_kzt"]):
+        # Keep Python integers: float64 cannot distinguish adjacent sums above 2**53.
+        exact_totals = {
+            pair: sum(int(value) for value in amounts)
+            for pair, amounts in transactions.groupby(["src", "dst"])["sum_kzt"]
+        }
+        amounts_match = all(
+            amount == exact_totals[(src, dst)]
+            for src, dst, amount in edges[["src", "dst", "sum_kzt"]].itertuples(index=False, name=None)
+        )
+    else:
+        amounts_match = all(_same_money(edge, tx) for edge, tx in zip(merged["sum_kzt_edge"], merged["sum_kzt_tx"]))
+    if not amounts_match:
         raise ValueError("sum_kzt в edges не совпадает с агрегированными transactions")
 
 
