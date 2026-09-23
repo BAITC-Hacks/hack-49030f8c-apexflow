@@ -17,7 +17,7 @@ def sample_inputs(n: int = 21):
 
 def sample_results(nodes):
     roles = pd.DataFrame({"gid": nodes.gid, "role": ["peripheral"] * len(nodes), "role_score": [0.1] * len(nodes), "cluster_id": [1] * len(nodes), "priority_score": [round(1 - i / 1000, 3) for i in range(len(nodes))], "evidence": ["Наблюдаемые связи: 0."] * len(nodes)})
-    clusters = pd.DataFrame({"cluster_id": [1], "n_nodes": [len(nodes)], "n_seed": [1], "sum_kzt_internal": [2000.0], "top_gids": [json.dumps(list(nodes.gid.head(3)))], "hypothesis": ["Единая тестовая компонента"]})
+    clusters = pd.DataFrame({"cluster_id": [1], "n_nodes": [len(nodes)], "n_seed": [int(nodes.is_seed.sum())], "sum_kzt_internal": [(len(nodes) - 1) * 100.0], "top_gids": [json.dumps(list(nodes.gid.head(3)))], "hypothesis": ["Единая тестовая компонента"]})
     top = roles.sort_values(["priority_score", "gid"], ascending=[False, True]).head(20).copy()
     top.insert(0, "rank", range(1, len(top) + 1))
     top["why"] = "Тестовое объяснение"
@@ -42,4 +42,50 @@ def test_output_cannot_lose_an_isolate():
     results = sample_results(nodes)
     results["nodes_roles"] = results["nodes_roles"].iloc[:-1]
     with pytest.raises(ValueError, match="каждый gid"):
+        validate_outputs(results, nodes, edges)
+
+
+@pytest.mark.parametrize("n", [1, 7, 21])
+def test_small_samples_use_minimum_of_twenty_and_node_count(n):
+    nodes, edges, transactions = sample_inputs(n)
+    validate_inputs(nodes, edges, transactions)
+    validate_outputs(sample_results(nodes), nodes, edges)
+
+
+@pytest.mark.parametrize("table,column,value", [
+    ("nodes_roles", "gid", 1.5),
+    ("nodes_roles", "priority_score", True),
+    ("nodes_roles", "evidence", None),
+    ("clusters", "sum_kzt_internal", float("nan")),
+    ("clusters", "sum_kzt_internal", 999),
+    ("clusters", "n_seed", 0),
+    ("clusters", "top_gids", "[true]"),
+    ("clusters", "top_gids", "[[1]]"),
+    ("clusters", "top_gids", "[2,1]"),
+    ("top_nodes", "why", None),
+])
+def test_invalid_outputs_fail_closed(table, column, value):
+    nodes, edges, _ = sample_inputs()
+    results = sample_results(nodes)
+    results[table][column] = results[table][column].astype(object)
+    results[table].loc[0, column] = value
+    with pytest.raises(ValueError):
+        validate_outputs(results, nodes, edges)
+
+
+def test_numeric_strings_and_unsigned_overflow_are_rejected():
+    nodes, edges, transactions = sample_inputs()
+    edges["sum_kzt"] = edges["sum_kzt"].astype(str)
+    with pytest.raises(ValueError, match="числовые"):
+        validate_inputs(nodes, edges, transactions)
+    nodes["gid"] = pd.Series([2**63 + i for i in range(len(nodes))], dtype="uint64")
+    with pytest.raises(ValueError, match="int64"):
+        validate_inputs(nodes, edges, transactions)
+
+
+def test_unsorted_roles_are_rejected_before_publication():
+    nodes, edges, _ = sample_inputs()
+    results = sample_results(nodes)
+    results["nodes_roles"] = results["nodes_roles"].iloc[::-1]
+    with pytest.raises(ValueError, match="отсортированы"):
         validate_outputs(results, nodes, edges)
