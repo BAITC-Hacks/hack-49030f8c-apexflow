@@ -30,16 +30,16 @@ def _positive_quantile(
 def derive_thresholds(features: pd.DataFrame) -> dict[str, float]:
     """Derive robust, dataset-relative thresholds without hard-coded identifiers."""
     return {
-        "many_in_degree": _positive_quantile(features["in_degree"], 0.75, 3.0),
-        "many_out_degree": _positive_quantile(features["out_degree"], 0.75, 5.0),
-        "substantial_in_sum": _positive_quantile(features["in_sum"], 0.75, 1.0),
+        "many_in_degree": _positive_quantile(features["funded_in_degree"], 0.75, 3.0),
+        "many_out_degree": _positive_quantile(features["funded_out_degree"], 0.75, 5.0),
+        "substantial_in_sum": _positive_quantile(features["external_in_sum"], 0.75, 1.0),
         "high_betweenness": _positive_quantile(
             features["betweenness"], 0.90, 0.0, empty=float("inf")
         ),
-        "in_degree_scale": _positive_quantile(features["in_degree"], 0.95, 1.0),
-        "out_degree_scale": _positive_quantile(features["out_degree"], 0.95, 1.0),
-        "in_sum_scale": _positive_quantile(features["in_sum"], 0.95, 1.0),
-        "out_sum_scale": _positive_quantile(features["out_sum"], 0.95, 1.0),
+        "in_degree_scale": _positive_quantile(features["funded_in_degree"], 0.95, 1.0),
+        "out_degree_scale": _positive_quantile(features["funded_out_degree"], 0.95, 1.0),
+        "in_sum_scale": _positive_quantile(features["external_in_sum"], 0.95, 1.0),
+        "out_sum_scale": _positive_quantile(features["external_out_sum"], 0.95, 1.0),
         "betweenness_scale": _positive_quantile(
             features["betweenness"], 0.95, 0.0, empty=1.0
         ),
@@ -88,8 +88,8 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
     result = compute_priority(features)
     thresholds = derive_thresholds(result)
 
-    has_inflow = result["in_sum"] > 0
-    has_outflow = result["out_sum"] > 0
+    has_inflow = result["external_in_sum"] > 0
+    has_outflow = result["external_out_sum"] > 0
     eligible_endpoint = (
         ~result["is_seed"] & ~result["is_boundary"] & ~result["has_self_loop"]
     )
@@ -104,17 +104,17 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
         "terminal": (
             eligible_endpoint
             & has_inflow
-            & (result["in_sum"] >= thresholds["substantial_in_sum"])
+            & (result["external_in_sum"] >= thresholds["substantial_in_sum"])
             & (result["flow_ratio"] <= 0.10)
         ),
         "consolidator": (
             has_inflow
-            & (result["in_degree"] >= thresholds["many_in_degree"])
-            & (result["in_sum"] >= thresholds["substantial_in_sum"])
+            & (result["funded_in_degree"] >= thresholds["many_in_degree"])
+            & (result["external_in_sum"] >= thresholds["substantial_in_sum"])
         ),
         "distributor": (
             has_outflow
-            & (result["out_degree"] >= thresholds["many_out_degree"])
+            & (result["funded_out_degree"] >= thresholds["many_out_degree"])
         ),
         "coordinator": (
             (result["betweenness"] >= thresholds["high_betweenness"])
@@ -128,10 +128,10 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
     for role in reversed(ROLE_ORDER[:-1]):
         result.loc[masks[role], "role"] = role
 
-    in_strength = _strength(result["in_sum"], thresholds["in_sum_scale"])
-    out_strength = _strength(result["out_sum"], thresholds["out_sum_scale"])
-    in_degree_strength = _strength(result["in_degree"], thresholds["in_degree_scale"])
-    out_degree_strength = _strength(result["out_degree"], thresholds["out_degree_scale"])
+    in_strength = _strength(result["external_in_sum"], thresholds["in_sum_scale"])
+    out_strength = _strength(result["external_out_sum"], thresholds["out_sum_scale"])
+    in_degree_strength = _strength(result["funded_in_degree"], thresholds["in_degree_scale"])
+    out_degree_strength = _strength(result["funded_out_degree"], thresholds["out_degree_scale"])
     centrality_strength = _strength(
         result["betweenness"], thresholds["betweenness_scale"]
     )
@@ -184,23 +184,23 @@ def make_evidence(row: pd.Series) -> str:
     role = row["role"]
     if role == "coordinator":
         text = (
-            f"Связывает {int(row['n_seed_reachable'])} seed-направления и "
-            f"{int(row['neighbor_cluster_count'])} соседних кластеров; "
+            f"Достижим из {int(row['n_seed_reachable'])} seed; "
+            f"соседних кластеров {int(row['neighbor_cluster_count'])}; "
             f"центральность {row['betweenness']:.3g}."
         )
     elif role == "distributor":
         text = (
-            f"Исходящий объём {_money(row['out_sum'])}; внешних получателей "
-            f"{int(row['out_degree'])}. Признаки распределения."
+            f"Внешний исходящий объём {_money(row['external_out_sum'])}; получателей "
+            f"{int(row['funded_out_degree'])}. Признаки распределения."
         )
     elif role == "consolidator":
         text = (
-            f"Вход {_money(row['in_sum'])}; внешних плательщиков {int(row['in_degree'])}; "
-            f"наблюдаемый отток {row['flow_ratio']:.0%}."
+            f"Внешний вход {_money(row['external_in_sum'])}; плательщиков "
+            f"{int(row['funded_in_degree'])}. Признаки консолидации."
         )
     elif role == "terminal":
         text = (
-            f"Получает {_money(row['in_sum'])} от {int(row['in_degree'])} плательщиков; "
+            f"Получает {_money(row['external_in_sum'])} от {int(row['funded_in_degree'])} плательщиков; "
             f"наблюдаемый отток {row['flow_ratio']:.0%}. Кандидат на конечного получателя."
         )
     elif role == "transit":
@@ -242,5 +242,8 @@ def make_priority_why(row: pd.Series) -> str:
     ranked = sorted(observations, key=lambda key: -row[key])
     parts = [observations[key] for key in ranked if row[key] > 0][:3]
     if not parts:
-        return "Нет выраженных структурных сигналов; позиция определена стабильным порядком."
+        return (
+            "Приоритет 0: метрики не дают положительного вклада после нормализации; "
+            "при равном score порядок по gid."
+        )
     return _bounded("Приоритет: " + "; ".join(parts) + ".")
