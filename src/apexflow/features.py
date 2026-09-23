@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from numbers import Number
+import math
 from typing import Any
 
 import networkx as nx
@@ -15,13 +15,6 @@ BETWEENNESS_SAMPLES = 128
 BETWEENNESS_SEED = 42
 
 
-def _gid_key(value: Any) -> tuple[int, float | str]:
-    """Return a stable ordering key for numeric and string identifiers."""
-    if isinstance(value, Number):
-        return (0, float(value))
-    return (1, str(value))
-
-
 def _require_columns(frame: pd.DataFrame, columns: set[str], name: str) -> None:
     missing = columns.difference(frame.columns)
     if missing:
@@ -31,6 +24,44 @@ def _require_columns(frame: pd.DataFrame, columns: set[str], name: str) -> None:
 def _validate_inputs(nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
     _require_columns(nodes, {"gid", "depth", "is_seed"}, "nodes")
     _require_columns(edges, {"src", "dst", "sum_kzt", "n_tx"}, "edges")
+
+    # The pipeline owns full validation; these guards protect graph calculations
+    # from lossy IDs, truthy strings and invalid monetary weights at direct calls.
+    for frame, name, columns in (
+        (nodes, "nodes", ("gid", "depth")),
+        (edges, "edges", ("src", "dst", "n_tx")),
+    ):
+        for column in columns:
+            values = frame[column]
+            if len(values) and (
+                not pd.api.types.is_integer_dtype(values.dtype)
+                or values.isna().any()
+                or not values.between(-(2**63), 2**63 - 1).all()
+            ):
+                raise ValueError(f"{name}.{column} must contain int64-compatible integers")
+    if len(nodes) and (
+        not pd.api.types.is_bool_dtype(nodes["is_seed"].dtype)
+        or nodes["is_seed"].isna().any()
+    ):
+        raise ValueError("nodes.is_seed must contain booleans without missing values")
+    if not nodes["depth"].between(0, 4).all():
+        raise ValueError("nodes.depth must be between 0 and 4")
+    if not edges["n_tx"].gt(0).all():
+        raise ValueError("edges.n_tx must be positive")
+    amounts = edges["sum_kzt"]
+    if len(amounts) and (
+        not pd.api.types.is_numeric_dtype(amounts.dtype)
+        or pd.api.types.is_bool_dtype(amounts.dtype)
+        or pd.api.types.is_complex_dtype(amounts.dtype)
+        or amounts.isna().any()
+        or not amounts.map(math.isfinite).all()
+        or not amounts.ge(0).all()
+    ):
+        raise ValueError("edges.sum_kzt must contain finite nonnegative numbers")
+    try:
+        math.fsum(amounts)
+    except OverflowError as exc:
+        raise ValueError("Total observed amount exceeds the supported numeric range") from exc
 
     if nodes["gid"].isna().any() or nodes["gid"].duplicated().any():
         raise ValueError("nodes.gid must be present and unique")
@@ -49,11 +80,11 @@ def build_graph(nodes: pd.DataFrame, edges: pd.DataFrame) -> nx.DiGraph:
     _validate_inputs(nodes, edges)
     graph = nx.DiGraph()
 
-    for gid in sorted(nodes["gid"].tolist(), key=_gid_key):
-        graph.add_node(gid)
+    for row in nodes.sort_values("gid").itertuples(index=False):
+        graph.add_node(row.gid, depth=int(row.depth), is_seed=bool(row.is_seed))
 
     rows = edges[["src", "dst", "sum_kzt", "n_tx"]].to_dict("records")
-    for edge in sorted(rows, key=lambda row: (_gid_key(row["src"]), _gid_key(row["dst"]))):
+    for edge in sorted(rows, key=lambda row: (row["src"], row["dst"])):
         graph.add_edge(
             edge["src"],
             edge["dst"],
@@ -66,13 +97,17 @@ def build_graph(nodes: pd.DataFrame, edges: pd.DataFrame) -> nx.DiGraph:
 def _series_from_group(
     frame: pd.DataFrame, group: str, value: str, gids: pd.Series
 ) -> pd.Series:
-    grouped = frame.groupby(group, sort=False)[value].sum()
+    # Sort before accumulation: floating-point summation must not depend on input
+    # row order. Cast amounts before summing to avoid signed integer overflow.
+    ordered = frame.sort_values(["src", "dst"]).copy()
+    ordered[value] = ordered[value].astype(float)
+    grouped = ordered.groupby(group, sort=False)[value].sum()
     return gids.map(grouped).fillna(0.0).astype(float)
 
 
 def _reachable_seed_counts(graph: nx.DiGraph, seed_gids: list[Any]) -> dict[Any, int]:
     counts = dict.fromkeys(graph.nodes, 0)
-    for seed_gid in sorted(seed_gids, key=_gid_key):
+    for seed_gid in sorted(seed_gids):
         for gid in nx.descendants(graph, seed_gid):
             counts[gid] += 1
     return counts
@@ -125,7 +160,10 @@ def compute_features(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
         lambda gid: len(neighbors[gid])
     ).astype(int)
 
-    result["flow_ratio"] = 0.0
+    self_edges = edges.loc[edges["src"] == edges["dst"]]
+    result["self_sum"] = _series_from_group(self_edges, "src", "sum_kzt", result["gid"])
+    result["has_self_loop"] = result["gid"].isin(self_edges["src"])
+    result["flow_ratio"] = float("nan")
     positive_inflow = result["in_sum"] > 0
     result.loc[positive_inflow, "flow_ratio"] = (
         result.loc[positive_inflow, "out_sum"] / result.loc[positive_inflow, "in_sum"]
@@ -133,7 +171,7 @@ def compute_features(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
     result["observed_net"] = result["in_sum"] - result["out_sum"]
     result["is_boundary"] = result["depth"].eq(4)
     result["is_isolated"] = (
-        result["in_degree"].eq(0) & result["out_degree"].eq(0)
+        result["in_degree"].eq(0) & result["out_degree"].eq(0) & ~result["has_self_loop"]
     )
 
     reachable = _reachable_seed_counts(
@@ -156,8 +194,9 @@ def add_cluster_context(
     result["cluster_id"] = result["gid"].map(cluster_by_gid)
     if result["cluster_id"].isna().any():
         raise ValueError("clusters must assign every node")
+    result["cluster_id"] = result["cluster_id"].astype("int64")
 
-    adjacent_clusters: dict[Any, set[str]] = defaultdict(set)
+    adjacent_clusters: dict[Any, set[int]] = defaultdict(set)
     for edge in edges.loc[edges["src"] != edges["dst"], ["src", "dst"]].itertuples(index=False):
         source_cluster = cluster_by_gid[edge.src]
         destination_cluster = cluster_by_gid[edge.dst]

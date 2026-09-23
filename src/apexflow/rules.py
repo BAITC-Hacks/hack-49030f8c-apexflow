@@ -40,7 +40,9 @@ def derive_thresholds(features: pd.DataFrame) -> dict[str, float]:
         "out_degree_scale": _positive_quantile(features["out_degree"], 0.95, 1.0),
         "in_sum_scale": _positive_quantile(features["in_sum"], 0.95, 1.0),
         "out_sum_scale": _positive_quantile(features["out_sum"], 0.95, 1.0),
-        "betweenness_scale": _positive_quantile(features["betweenness"], 0.95, 1.0),
+        "betweenness_scale": _positive_quantile(
+            features["betweenness"], 0.95, 0.0, empty=1.0
+        ),
         "seed_reach_scale": _positive_quantile(features["n_seed_reachable"], 0.95, 1.0),
         "neighbor_cluster_scale": _positive_quantile(
             features["neighbor_cluster_count"], 0.95, 1.0
@@ -63,13 +65,21 @@ def _minmax(series: pd.Series) -> pd.Series:
 def compute_priority(features: pd.DataFrame) -> pd.DataFrame:
     """Add a global review-priority score from volume, degree, centrality and reach."""
     result = features.copy()
-    volume = (result["in_sum"] + result["out_sum"]).map(math.log1p)
-    result["priority_score"] = (
-        0.35 * _minmax(volume)
-        + 0.25 * _minmax(result["unique_neighbor_count"])
-        + 0.25 * _minmax(result["betweenness"])
-        + 0.15 * _minmax(result["n_seed_reachable"])
-    ).clip(lower=0.0, upper=1.0)
+    # log1p(a + b), without overflowing when both observed totals are large.
+    volume = pd.Series(
+        [math.log1p(max(a, b)) + math.log1p(min(a, b) / (1 + max(a, b)))
+         for a, b in zip(result["in_sum"], result["out_sum"])],
+        index=result.index, dtype="float64",
+    )
+    contributions = {
+        "priority_volume": 0.35 * _minmax(volume),
+        "priority_degree": 0.25 * _minmax(result["unique_neighbor_count"]),
+        "priority_centrality": 0.25 * _minmax(result["betweenness"]),
+        "priority_reach": 0.15 * _minmax(result["n_seed_reachable"]),
+    }
+    for name, values in contributions.items():
+        result[name] = values
+    result["priority_score"] = sum(contributions.values()).clip(0.0, 1.0)
     return result
 
 
@@ -80,7 +90,9 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
 
     has_inflow = result["in_sum"] > 0
     has_outflow = result["out_sum"] > 0
-    eligible_endpoint = ~result["is_seed"] & ~result["is_boundary"]
+    eligible_endpoint = (
+        ~result["is_seed"] & ~result["is_boundary"] & ~result["has_self_loop"]
+    )
 
     masks = {
         "transit": (
@@ -113,7 +125,7 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
     }
 
     result["role"] = "peripheral"
-    for role in ("transit", "terminal", "consolidator", "distributor", "coordinator"):
+    for role in reversed(ROLE_ORDER[:-1]):
         result.loc[masks[role], "role"] = role
 
     in_strength = _strength(result["in_sum"], thresholds["in_sum_scale"])
@@ -154,6 +166,8 @@ def assign_roles(features: pd.DataFrame) -> pd.DataFrame:
 
 def _money(value: Any) -> str:
     amount = float(value)
+    if amount >= 1_000_000_000_000:
+        return f"{amount:.3g} KZT"
     if amount >= 1_000_000:
         return f"{amount / 1_000_000:.1f} млн KZT"
     if amount >= 1_000:
@@ -172,17 +186,17 @@ def make_evidence(row: pd.Series) -> str:
         text = (
             f"Связывает {int(row['n_seed_reachable'])} seed-направления и "
             f"{int(row['neighbor_cluster_count'])} соседних кластеров; "
-            f"центральность {row['betweenness']:.3f}."
+            f"центральность {row['betweenness']:.3g}."
         )
     elif role == "distributor":
         text = (
-            f"Отправляет {_money(row['out_sum'])} {int(row['out_degree'])} "
-            "наблюдаемым получателям; есть признаки распределения."
+            f"Исходящий объём {_money(row['out_sum'])}; внешних получателей "
+            f"{int(row['out_degree'])}. Признаки распределения."
         )
     elif role == "consolidator":
         text = (
-            f"Получает от {int(row['in_degree'])} плательщиков "
-            f"{_money(row['in_sum'])}; наблюдаемый отток {row['flow_ratio']:.0%}."
+            f"Вход {_money(row['in_sum'])}; внешних плательщиков {int(row['in_degree'])}; "
+            f"наблюдаемый отток {row['flow_ratio']:.0%}."
         )
     elif role == "terminal":
         text = (
@@ -197,25 +211,36 @@ def make_evidence(row: pd.Series) -> str:
     elif bool(row["is_isolated"]):
         text = "В доступном графе нет входящих и исходящих связей."
     else:
-        text = "Нет достаточного сочетания структурных признаков для отдельной роли."
+        text = (
+            f"{int(row['in_degree'])} плательщиков, {int(row['out_degree'])} получателей; "
+            "недостаточно признаков отдельной роли."
+        )
 
+    limitations = ""
+    if bool(row["is_seed"]):
+        limitations += " Seed: входящие неполны."
     if bool(row["is_boundary"]):
-        text += " Depth=4: исходящие связи могут быть обрезаны."
-    return _bounded(text)
+        limitations += " Depth=4: исходящие могут быть обрезаны."
+    if bool(row["has_self_loop"]):
+        limitations += f" Самопереводы: {_money(row['self_sum'])}."
+    return _bounded(text, 200 - len(limitations)) + limitations
 
 
 def make_priority_why(row: pd.Series) -> str:
     """Explain why a node is in the global review queue."""
-    parts: list[str] = []
     turnover = float(row["in_sum"] + row["out_sum"])
-    if turnover > 0:
-        parts.append(f"оборот {_money(turnover)}")
-    if int(row["unique_neighbor_count"]) > 0:
-        parts.append(f"{int(row['unique_neighbor_count'])} контрагентов")
-    if float(row["betweenness"]) > 0:
-        parts.append(f"центральность {row['betweenness']:.3f}")
-    if int(row["n_seed_reachable"]) > 0:
-        parts.append(f"достижим из {int(row['n_seed_reachable'])} seed")
+    volume_text = (
+        f"оборот {_money(turnover)}" if math.isfinite(turnover)
+        else f"вход {_money(row['in_sum'])}, выход {_money(row['out_sum'])}"
+    )
+    observations = {
+        "priority_volume": volume_text,
+        "priority_degree": f"{int(row['unique_neighbor_count'])} контрагентов",
+        "priority_centrality": f"центральность {row['betweenness']:.3g}",
+        "priority_reach": f"достижим из {int(row['n_seed_reachable'])} seed",
+    }
+    ranked = sorted(observations, key=lambda key: -row[key])
+    parts = [observations[key] for key in ranked if row[key] > 0][:3]
     if not parts:
         return "Нет выраженных структурных сигналов; позиция определена стабильным порядком."
-    return _bounded("Приоритет: " + "; ".join(parts[:3]) + ".")
+    return _bounded("Приоритет: " + "; ".join(parts) + ".")

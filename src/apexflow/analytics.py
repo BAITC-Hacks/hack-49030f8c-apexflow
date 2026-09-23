@@ -8,7 +8,7 @@ from typing import Any
 import networkx as nx
 import pandas as pd
 
-from .features import _gid_key, add_cluster_context, build_graph, compute_features
+from .features import _validate_inputs, add_cluster_context, compute_features
 from .rules import assign_roles, make_evidence, make_priority_why
 
 
@@ -38,16 +38,16 @@ def _scalar(value: Any) -> Any:
 
 def assign_clusters(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
     """Find Louvain communities and give them deterministic, presentation-safe IDs."""
-    build_graph(nodes, edges)  # Reuse the input-contract checks used by features.
+    _validate_inputs(nodes, edges)
     graph = nx.Graph()
-    gids = sorted(nodes["gid"].tolist(), key=_gid_key)
+    gids = sorted(nodes["gid"].tolist())
     graph.add_nodes_from(gids)
 
     edge_rows = edges[["src", "dst", "sum_kzt"]].to_dict("records")
     for edge in sorted(
-        edge_rows, key=lambda row: (_gid_key(row["src"]), _gid_key(row["dst"]))
+        edge_rows, key=lambda row: (row["src"], row["dst"])
     ):
-        if edge["src"] == edge["dst"]:
+        if edge["src"] == edge["dst"] or edge["sum_kzt"] == 0:
             continue
         weight = float(edge["sum_kzt"])
         if graph.has_edge(edge["src"], edge["dst"]):
@@ -55,7 +55,7 @@ def assign_clusters(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
         else:
             graph.add_edge(edge["src"], edge["dst"], weight=weight)
 
-    isolates = sorted(nx.isolates(graph), key=_gid_key)
+    isolates = sorted(nx.isolates(graph))
     isolate_set = set(isolates)
     connected = graph.subgraph([gid for gid in graph if gid not in isolate_set]).copy()
     communities: list[set[Any]] = []
@@ -67,14 +67,13 @@ def assign_clusters(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
             )
         )
     communities.extend({gid} for gid in isolates)
-    communities.sort(key=lambda community: _gid_key(min(community, key=_gid_key)))
+    communities.sort(key=min)
 
     records = []
     for index, community in enumerate(communities, start=1):
-        cluster_id = f"cluster-{index:03d}"
-        for gid in sorted(community, key=_gid_key):
-            records.append({"gid": gid, "cluster_id": cluster_id})
-    return pd.DataFrame(records, columns=["gid", "cluster_id"])
+        for gid in sorted(community):
+            records.append({"gid": gid, "cluster_id": index})
+    return pd.DataFrame(records, columns=["gid", "cluster_id"], dtype="int64")
 
 
 def _hypothesis(group: pd.DataFrame) -> str:
@@ -103,7 +102,8 @@ def summarize_clusters(
         return pd.DataFrame(columns=CLUSTERS_COLUMNS)
 
     cluster_by_gid = features.set_index("gid")["cluster_id"].to_dict()
-    edge_clusters = edges[["src", "dst", "sum_kzt"]].copy()
+    edge_clusters = edges[["src", "dst", "sum_kzt"]].sort_values(["src", "dst"]).copy()
+    edge_clusters["sum_kzt"] = edge_clusters["sum_kzt"].astype(float)
     edge_clusters["src_cluster"] = edge_clusters["src"].map(cluster_by_gid)
     edge_clusters["dst_cluster"] = edge_clusters["dst"].map(cluster_by_gid)
     internal_sums = (
@@ -141,7 +141,10 @@ def _top_nodes(features: pd.DataFrame) -> pd.DataFrame:
     ).head(min(20, len(features)))
     result = ranked[["gid", "role", "priority_score"]].copy()
     result.insert(0, "rank", range(1, len(result) + 1))
-    result["why"] = ranked.apply(make_priority_why, axis=1).to_list()
+    result["why"] = pd.Series(
+        [make_priority_why(row) for _, row in ranked.iterrows()],
+        index=result.index, dtype="object",
+    )
     return result[TOP_NODES_COLUMNS].reset_index(drop=True)
 
 
@@ -158,13 +161,19 @@ def analyze(
     clusters = assign_clusters(nodes, edges)
     features = add_cluster_context(compute_features(nodes, edges), edges, clusters)
     scored = assign_roles(features)
-    scored["evidence"] = scored.apply(make_evidence, axis=1)
+    scored["evidence"] = pd.Series(
+        [make_evidence(row) for _, row in scored.iterrows()],
+        index=scored.index, dtype="object",
+    )
 
-    nodes_roles = scored[NODES_ROLES_COLUMNS].sort_values(
+    nodes_roles = scored[NODES_ROLES_COLUMNS].astype({"gid": "int64"}).sort_values(
         "gid", kind="mergesort"
     ).reset_index(drop=True)
+    cluster_summary = summarize_clusters(scored, edges).astype(
+        {"cluster_id": "int64", "n_nodes": "int64", "n_seed": "int64", "sum_kzt_internal": "float64"}
+    )
     return {
         "nodes_roles": nodes_roles,
-        "clusters": summarize_clusters(scored, edges),
-        "top_nodes": _top_nodes(scored),
+        "clusters": cluster_summary,
+        "top_nodes": _top_nodes(scored).astype({"gid": "int64"}),
     }
