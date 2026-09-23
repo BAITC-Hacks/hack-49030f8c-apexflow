@@ -1,0 +1,29 @@
+services:
+  pipeline:
+    build:
+      context: .
+      target: runtime
+    command: python -m apexflow --data /app/data --output /app/output
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+
+  ui:
+    build:
+      context: .
+      target: runtime
+    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output:ro
+    ports:
+      - "8501:8501"
+
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
