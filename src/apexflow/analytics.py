@@ -55,6 +55,12 @@ def assign_clusters(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
         else:
             graph.add_edge(edge["src"], edge["dst"], weight=weight)
 
+    # Louvain uses squared total weights internally. Scaling avoids overflow
+    # for large amounts; ratios below float64's range can still underflow.
+    weight_scale = max((data["weight"] for _, _, data in graph.edges(data=True)), default=1.0)
+    for _, _, data in graph.edges(data=True):
+        data["weight"] /= weight_scale
+
     isolates = sorted(nx.isolates(graph))
     isolate_set = set(isolates)
     connected = graph.subgraph([gid for gid in graph if gid not in isolate_set]).copy()
@@ -82,15 +88,20 @@ def _hypothesis(group: pd.DataFrame) -> str:
     if len(group) == 1 and bool(group.iloc[0]["is_isolated"]):
         return "Изолированный узел: наблюдаемых связей в графе нет."
     if seed_count >= 2:
-        return f"Связанная группа охватывает {seed_count} seed-направления; проверьте общий контур."
+        return f"В группе {seed_count} seed-узлов; проверьте связи между ними."
+    subject = "У узла" if len(group) == 1 else "В группе"
     if roles.get("coordinator", 0):
-        return "В группе есть структурный координатор; проверьте связи между сообществами."
+        return f"{subject} есть признаки структурного посредничества; проверьте связи между сообществами."
     if roles.get("consolidator", 0):
-        return "В группе есть признаки консолидации поступлений у приоритетных узлов."
+        return f"{subject} есть признаки консолидации поступлений."
     if roles.get("distributor", 0):
-        return "В группе есть признаки распределения средств нескольким получателям."
+        return f"{subject} есть признаки распределения средств нескольким получателям."
     if roles.get("transit", 0):
-        return "В группе есть признаки транзитного пропуска средств."
+        return f"{subject} есть признаки транзитного пропуска средств."
+    if roles.get("terminal", 0):
+        return "Есть кандидат на конечного получателя в выборке; проверьте дальнейшие исходящие."
+    if len(group) == 1:
+        return "Одиночный кластер с наблюдаемыми связями; недостаточно признаков отдельной роли."
     return "Связанная группа без достаточных признаков отдельной роли; проверьте лидирующие связи."
 
 
