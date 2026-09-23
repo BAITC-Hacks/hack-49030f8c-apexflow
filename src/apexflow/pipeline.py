@@ -7,7 +7,7 @@ from time import perf_counter
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from .io import OUTPUT_COLUMNS, load_inputs, validate_outputs, write_outputs
+from .io import OUTPUT_COLUMNS, load_inputs, validate_outputs, write_outputs, write_run_manifest
 from .provenance import atomic_json, data_profile, fingerprint, input_fingerprints, runtime_identity
 
 
@@ -23,7 +23,7 @@ def run_pipeline(data_dir: str | Path, output_dir: str | Path, *, acceptance: bo
     except FileExistsError as exc:
         raise RuntimeError("Другой pipeline использует output; после аварии проверьте процесс и lock") from exc
     run_id = uuid4().hex
-    status = {"run_id": run_id, "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+    status = {"schema_version": 1, "run_id": run_id, "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
     stage = "prepare"
     timings = {}
     with handle:
@@ -31,6 +31,7 @@ def run_pipeline(data_dir: str | Path, output_dir: str | Path, *, acceptance: bo
         handle.flush()
         try:
             atomic_json(output_dir / "run_status.json", status)
+            write_run_manifest(output_dir, status)
             stage = "load_validate"
             tick = perf_counter()
             inputs = input_fingerprints(data_dir)
@@ -71,18 +72,24 @@ def run_pipeline(data_dir: str | Path, output_dir: str | Path, *, acceptance: bo
             if acceptance and seconds >= 300:
                 raise ValueError(f"Приёмка: pipeline занял {seconds:.3f} с, требуется <300 с")
             report["seconds"] = seconds
-            manifest = {"schema_version": 1, **status, "status": "succeeded",
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                        "inputs": inputs, "outputs": outputs, "runtime": runtime,
+            manifest = {"schema_version": 1, **status, "status": "complete",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "revision": runtime["revision"], "python": runtime["python"],
+                        "dependencies": {name: runtime["packages"][name] for name in ("pandas", "pyarrow", "networkx")},
+                        "inputs": {name: meta["sha256"] for name, meta in inputs.items()},
+                        "outputs": {name: meta["sha256"] for name, meta in outputs.items()},
+                        "input_files": inputs, "output_files": outputs, "runtime": runtime,
                         "parameters": {"acceptance": acceptance, "analytics": "analyze defaults"},
                         "timings_seconds": timings, "report": report, "profile": profile}
             atomic_json(output_dir / "run_manifest.json", manifest)
-            atomic_json(output_dir / "run_status.json", {**status, "status": "succeeded"})
+            atomic_json(output_dir / "run_status.json", {**status, "status": "complete"})
             return report
         except Exception as exc:
-            # Keep last successful manifest, but explicitly invalidate its freshness.
+            # Both UI and CLI must reject a failed rerun under the shared manifest contract.
             atomic_json(output_dir / "run_status.json", {**status, "status": "failed", "stage": stage})
-            raise RuntimeError(f"Этап {stage}: {exc}") from exc
+            write_run_manifest(output_dir, {**status, "status": "failed", "stage": stage})
+            error_class = ValueError if isinstance(exc, ValueError) else RuntimeError
+            raise error_class(f"Этап {stage}: {exc}") from exc
         finally:
             handle.close()
             lock.unlink(missing_ok=True)

@@ -16,6 +16,7 @@ case "${OSTYPE:-}" in
 esac
 run_dir="$(mktemp -d "$project_root/.ci/smoke.XXXXXX")"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-apexflow-smoke}"
+export APEXFLOW_IMAGE_TAG="$COMPOSE_PROJECT_NAME"
 export APEXFLOW_DATA_DIR="$run_dir/data"
 export APEXFLOW_OUTPUT_DIR="$run_dir/output"
 export APEXFLOW_PORT="${APEXFLOW_PORT:-18501}"
@@ -29,7 +30,7 @@ cleanup() {
 trap cleanup EXIT
 docker compose config --quiet
 docker compose --profile test build pipeline tests
-docker run --rm --network none "$COMPOSE_PROJECT_NAME-runtime" python -c \
+docker run --rm --network none "apexflow:$APEXFLOW_IMAGE_TAG" python -c \
   'from pathlib import Path; p=Path("/app"); assert not list(p.rglob("*.parquet")); assert not (p/"output").exists(); assert not (p/".git").exists(); assert not list(p.rglob(".env"))'
 docker compose --profile test run --rm --no-deps -v "$run_dir/reports:/reports" tests \
   pytest -q -o cache_dir=/tmp/pytest-cache --junitxml=/reports/pytest.xml

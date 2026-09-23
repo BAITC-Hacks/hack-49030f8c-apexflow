@@ -5,9 +5,9 @@ COPY requirements*.txt .
 RUN pip install --no-cache-dir -c requirements-lock.txt -r requirements.txt && pip check
 COPY . .
 RUN groupadd --gid 10001 apexflow && useradd --uid 10001 --gid apexflow --create-home apexflow
-ARG VCS_REF=unknown
-ENV APEXFLOW_REVISION=$VCS_REF
-LABEL org.opencontainers.image.revision=$VCS_REF
+ARG APEXFLOW_REVISION=unknown
+ENV APEXFLOW_REVISION=$APEXFLOW_REVISION
+LABEL org.opencontainers.image.revision=$APEXFLOW_REVISION
 
 FROM base AS test
 COPY requirements-dev.txt .

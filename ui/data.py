@@ -10,7 +10,7 @@ from typing import Mapping
 
 import pandas as pd
 
-from apexflow.io import OUTPUT_COLUMNS, validate_graph_inputs, validate_outputs
+from apexflow.io import OUTPUT_COLUMNS, RUN_MANIFEST, validate_graph_inputs, validate_outputs, validate_run_manifest
 
 
 ROLE_LABELS = {
@@ -38,6 +38,7 @@ class ViewData:
     edges: pd.DataFrame
     raw_csv: Mapping[str, bytes]
     source: str
+    period: str = "Период не задан: синтетический пример"
 
 
 def parse_gid(value: object) -> str:
@@ -76,6 +77,7 @@ def validate_view_data(
     nodes_roles: pd.DataFrame, clusters: pd.DataFrame, top_nodes: pd.DataFrame,
     nodes: pd.DataFrame, edges: pd.DataFrame, *,
     raw_csv: Mapping[str, bytes] | None = None, source: str = "CSV с диска",
+    period: str = "Период не задан: синтетический пример",
 ) -> ViewData:
     tables = {"nodes_roles": nodes_roles, "clusters": clusters, "top_nodes": top_nodes}
     try:
@@ -104,13 +106,15 @@ def validate_view_data(
     csv_bytes = dict(raw_csv) if raw_csv is not None else {
         f"{name}.csv": frame.to_csv(index=False).encode("utf-8") for name, frame in results.items()
     }
-    return ViewData(roles, cluster_table, top, source_nodes, source_edges, csv_bytes, source)
+    return ViewData(roles, cluster_table, top, source_nodes, source_edges, csv_bytes, source, period)
 
 
 def expected_paths(data_dir: str | Path, output_dir: str | Path) -> dict[str, Path]:
     return {
         "nodes.parquet": Path(data_dir) / "nodes.parquet",
         "edges.parquet": Path(data_dir) / "edges.parquet",
+        "transactions.parquet": Path(data_dir) / "transactions.parquet",
+        RUN_MANIFEST: Path(output_dir) / RUN_MANIFEST,
         **{f"{name}.csv": Path(output_dir) / f"{name}.csv" for name in OUTPUT_COLUMNS},
     }
 
@@ -132,6 +136,7 @@ def load_view_data(data_dir: str | Path, output_dir: str | Path) -> ViewData:
     paths = expected_paths(data_dir, output_dir)
     before = file_signature(data_dir, output_dir)
     try:
+        validate_run_manifest(data_dir, output_dir)
         # Parse and download the same snapshot, never read each CSV twice.
         raw_csv = {f"{name}.csv": paths[f"{name}.csv"].read_bytes() for name in OUTPUT_COLUMNS}
         tables = {
@@ -140,13 +145,18 @@ def load_view_data(data_dir: str | Path, output_dir: str | Path) -> ViewData:
         }
         nodes = pd.read_parquet(paths["nodes.parquet"])
         edges = pd.read_parquet(paths["edges.parquet"])
+        dates = pd.to_datetime(pd.read_parquet(paths["transactions.parquet"], columns=["date"])["date"], errors="raise")
+        period = (f"Наблюдаемые даты операций: {dates.min():%d.%m.%Y} — {dates.max():%d.%m.%Y}"
+                  if not dates.empty else "Период не определён: наблюдаемых транзакций нет")
+        validate_run_manifest(data_dir, output_dir)
     except Exception as error:  # engine-specific decode errors are user-facing
         raise ViewDataError(f"Не удалось прочитать входные файлы: {error}") from error
     if before != file_signature(data_dir, output_dir):
         raise ViewDataError("Файлы изменились во время чтения. Дождитесь завершения pipeline и обновите данные.")
     return validate_view_data(
         tables["nodes_roles"], tables["clusters"], tables["top_nodes"], nodes, edges,
-        raw_csv=raw_csv, source="CSV с диска; свежесть расчёта проверяется отдельным запуском pipeline",
+        raw_csv=raw_csv, source="Результат pipeline: SHA256 входных данных и CSV совпадают с завершённым расчётом",
+        period=period,
     )
 
 

@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check the synthetic web demo in a container
         run: docker run --rm --network none -v "$PWD:/work:ro" -w /work node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 sh -c 'node --check site/app.js && node --test tests/test_site.mjs'
-  container-integration:
+  runtime-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -43,15 +43,26 @@ jobs:
       - name: Ensure containers are stopped
         if: always()
         run: docker compose down --remove-orphans
-  release-policy:
+  release-source:
     runs-on: ubuntu-latest
     steps:
-      - name: Require releases to originate from staging
+      - name: Require production pull requests to come from this repository's staging
         env:
-          BASE: ${{ github.base_ref }}
-          HEAD: ${{ github.head_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          if [ "$BASE" = main ] && [ "$HEAD" != staging ]; then
-            echo 'Release pull requests must use staging as their head branch.' >&2
-            exit 1
+          if [ "$EVENT_NAME" = pull_request ] && [ "$BASE_REF" = main ]; then
+            test "$HEAD_REF" = staging
+            test "$HEAD_REPOSITORY" = "$REPOSITORY"
           fi
+  compose-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build and run contract tests in the test image
+        run: docker compose --profile test run --rm --build tests

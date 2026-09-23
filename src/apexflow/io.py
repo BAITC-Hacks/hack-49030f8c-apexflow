@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from pathlib import Path
 import shutil
+from pathlib import Path
 import tempfile
 from typing import Mapping
 
@@ -18,6 +19,51 @@ OUTPUT_COLUMNS = {
     "top_nodes": ["rank", "gid", "role", "priority_score", "why"],
 }
 ROLES = {"consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"}
+RUN_MANIFEST = "run_manifest.json"
+
+
+def file_hashes(directory: str | Path, filenames) -> dict[str, str]:
+    """Hash the actual files without interpreting or publishing their contents."""
+    hashes = {}
+    for filename in filenames:
+        with (Path(directory) / filename).open("rb") as source:
+            hashes[filename] = hashlib.file_digest(source, "sha256").hexdigest()
+    return hashes
+
+
+def write_run_manifest(output_dir: str | Path, manifest: dict) -> None:
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=".run.", suffix=".tmp", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+        except Exception:
+            handle.close()
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(directory / RUN_MANIFEST)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def validate_run_manifest(data_dir: str | Path, output_dir: str | Path) -> dict:
+    """Reject unfinished runs and CSVs calculated from a different input snapshot."""
+    try:
+        if (Path(output_dir) / ".pipeline.lock").exists():
+            raise ValueError("Pipeline выполняется или оставил lock после сбоя")
+        manifest = json.loads((Path(output_dir) / RUN_MANIFEST).read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
+            raise ValueError("Последний расчёт не завершён успешно. Выполните pipeline заново.")
+        if manifest.get("inputs") != file_hashes(data_dir, INPUT_FILES.values()):
+            raise ValueError("Исходные данные изменились после расчёта. Выполните pipeline заново.")
+        if manifest.get("outputs") != file_hashes(output_dir, [f"{name}.csv" for name in OUTPUT_COLUMNS]):
+            raise ValueError("CSV изменились после расчёта. Выполните pipeline заново.")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Не удалось подтвердить свежесть результатов: {exc}. Выполните pipeline заново.") from exc
+    return manifest
 
 
 def load_inputs(data_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -52,10 +98,25 @@ def _integer_column(frame: pd.DataFrame, column: str, table: str, *, positive: b
 
 def _finite_column(frame: pd.DataFrame, column: str, table: str) -> None:
     values = frame[column]
-    if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
+    if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values) or pd.api.types.is_complex_dtype(values):
         raise ValueError(f"{table}.{column} должен содержать числовые значения, не строки/bool")
     if values.isna().any() or not values.map(math.isfinite).all():
         raise ValueError(f"{table}.{column} должен содержать только конечные числовые значения")
+    if (values < 0).any():
+        raise ValueError(f"{table}.{column} должен содержать неотрицательные значения")
+
+
+def _money_sum(values) -> float:
+    try:
+        return math.fsum(float(value) for value in values)
+    except OverflowError as exc:
+        raise ValueError("Суммарный оборот выходит за конечный диапазон чисел") from exc
+
+
+def _same_money(left: float, right: float) -> bool:
+    # Allow only floating-point accumulation noise, not a percentage of turnover.
+    tolerance = max(1e-9, 4 * math.ulp(float(left)), 4 * math.ulp(float(right)))
+    return abs(float(left) - float(right)) <= tolerance
 
 
 def validate_graph_inputs(nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
@@ -75,8 +136,7 @@ def validate_graph_inputs(nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
         if not frame["depth"].between(0, 4).all():
             raise ValueError(f"{name}.depth содержит значения вне диапазона 0..4")
     _finite_column(edges, "sum_kzt", "edges")
-    if edges["sum_kzt"].lt(0).any():
-        raise ValueError("edges.sum_kzt: отрицательные суммы не поддерживаются аналитикой")
+    _money_sum(edges["sum_kzt"])
     _validate_endpoints(nodes, edges, "edges")
     if edges.duplicated(["src", "dst"]).any():
         raise ValueError("edges содержит повторные направленные пары; выясните источник")
@@ -94,8 +154,7 @@ def validate_inputs(nodes: pd.DataFrame, edges: pd.DataFrame, transactions: pd.D
     for column in ("src", "dst"):
         _integer_column(transactions, column, "transactions")
     _finite_column(transactions, "sum_kzt", "transactions")
-    if transactions["sum_kzt"].lt(0).any():
-        raise ValueError("transactions.sum_kzt: отрицательные суммы не поддерживаются аналитикой")
+    _money_sum(transactions["sum_kzt"])
     if not transactions.empty and pd.api.types.is_numeric_dtype(transactions["date"]):
         raise ValueError("transactions.date должен содержать даты, а не числовые метки без единиц")
     dates = pd.to_datetime(transactions["date"], errors="coerce")
@@ -106,18 +165,14 @@ def validate_inputs(nodes: pd.DataFrame, edges: pd.DataFrame, transactions: pd.D
 
 
 def _validate_aggregation(edges: pd.DataFrame, transactions: pd.DataFrame) -> None:
-    # Convert before summation: pandas integer groupby can silently wrap int64.
-    amounts = transactions.assign(sum_kzt=transactions["sum_kzt"].astype(float))
-    actual = amounts.groupby(["src", "dst"], as_index=False).agg(sum_kzt=("sum_kzt", "sum"), n_tx=("sum_kzt", "size"))
-    _finite_column(actual, "sum_kzt", "aggregated transactions")
+    actual = transactions.groupby(["src", "dst"], as_index=False).agg(sum_kzt=("sum_kzt", _money_sum), n_tx=("sum_kzt", "size"))
     expected = edges[["src", "dst", "sum_kzt", "n_tx"]]
     merged = expected.merge(actual, on=["src", "dst"], how="outer", suffixes=("_edge", "_tx"), indicator=True)
     if not (merged["_merge"] == "both").all():
         raise ValueError("Пары edges и агрегированные transactions не совпадают")
     if not (merged["n_tx_edge"] == merged["n_tx_tx"]).all():
         raise ValueError("n_tx в edges не совпадает с количеством transactions")
-    if not all(math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=1e-9)
-               for a, b in zip(merged["sum_kzt_edge"], merged["sum_kzt_tx"])):
+    if not all(_same_money(edge, tx) for edge, tx in zip(merged["sum_kzt_edge"], merged["sum_kzt_tx"])):
         raise ValueError("sum_kzt в edges не совпадает с агрегированными transactions")
 
 
@@ -162,10 +217,10 @@ def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, e
         raise ValueError("n_nodes/n_seed в clusters не совпадают с nodes_roles и nodes")
     _finite_column(clusters, "sum_kzt_internal", "clusters")
     lookup = roles.set_index("gid")
-    internal = edges.assign(sum_kzt=edges["sum_kzt"].astype(float), _src_cluster=edges["src"].map(lookup["cluster_id"]), _dst_cluster=edges["dst"].map(lookup["cluster_id"]))
-    sums = internal.loc[internal["_src_cluster"] == internal["_dst_cluster"]].groupby("_src_cluster")["sum_kzt"].sum()
+    internal = edges.assign(_src_cluster=edges["src"].map(lookup["cluster_id"]), _dst_cluster=edges["dst"].map(lookup["cluster_id"]))
+    sums = internal.loc[internal["_src_cluster"] == internal["_dst_cluster"]].groupby("_src_cluster")["sum_kzt"].agg(_money_sum)
     for cluster_id, total in actual["sum_kzt_internal"].items():
-        if not math.isclose(float(total), float(sums.get(cluster_id, 0)), rel_tol=1e-12, abs_tol=1e-9):
+        if not _same_money(total, sums.get(cluster_id, 0)):
             raise ValueError("clusters.sum_kzt_internal не совпадает с внутренними рёбрами")
     for _, row in clusters.iterrows():
         try:
@@ -174,8 +229,10 @@ def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, e
             raise ValueError("clusters.top_gids должен быть JSON-массивом") from exc
         if not isinstance(gids, list) or any(type(gid) is not int for gid in gids):
             raise ValueError("clusters.top_gids должен быть JSON-массивом целых gid")
+        if not 1 <= len(gids) <= 5:
+            raise ValueError("clusters.top_gids должен содержать от 1 до 5 gid")
         members = roles.loc[roles["cluster_id"] == row["cluster_id"]]
-        if not 1 <= len(gids) <= 5 or len(set(gids)) != len(gids) or not set(gids).issubset(set(members["gid"])):
+        if len(set(gids)) != len(gids) or not set(gids).issubset(set(members["gid"])):
             raise ValueError("clusters.top_gids содержит gid не из своего кластера")
         ordered = members.sort_values(["priority_score", "gid"], ascending=[False, True])["gid"].head(len(gids)).tolist()
         if gids != ordered:

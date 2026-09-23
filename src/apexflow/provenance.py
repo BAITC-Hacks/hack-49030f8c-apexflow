@@ -98,7 +98,7 @@ def data_profile(nodes, edges, transactions) -> dict:
                            "total": float(frame["sum_kzt"].astype(float).sum())}
                     for name, frame in tables.items() if "sum_kzt" in frame},
         "edges_transactions_match": True,
-        "sum_tolerance": {"relative": 1e-12, "absolute_kzt": 1e-9},
+        "sum_tolerance": {"ulps": 4, "absolute_kzt": 1e-9},
     }
 
 
@@ -110,12 +110,13 @@ def verify_run(data_dir: str | Path, output_dir: str | Path) -> dict:
     status_bytes = (output_dir / "run_status.json").read_bytes()
     status = json.loads(status_bytes)
     manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
-    if (status.get("status") != "succeeded" or manifest.get("status") != "succeeded"
+    if (status.get("status") != "complete" or manifest.get("status") != "complete"
             or manifest.get("schema_version") != 1 or status.get("run_id") != manifest.get("run_id")):
         raise ValueError("Последний запуск не завершился успешно; старые CSV не являются свежими")
-    if manifest.get("inputs") != input_fingerprints(data_dir):
+    inputs = {name: meta["sha256"] for name, meta in input_fingerprints(data_dir).items()}
+    if manifest.get("inputs") != inputs:
         raise ValueError("Входные данные изменились после расчёта")
-    outputs = {f"{name}.csv": fingerprint(output_dir / f"{name}.csv") for name in OUTPUT_COLUMNS}
+    outputs = {f"{name}.csv": fingerprint(output_dir / f"{name}.csv")["sha256"] for name in OUTPUT_COLUMNS}
     if manifest.get("outputs") != outputs:
         raise ValueError("CSV не совпадают с хэшами успешного запуска")
     if manifest.get("runtime", {}).get("source_sha256") != runtime_identity()["source_sha256"]:
