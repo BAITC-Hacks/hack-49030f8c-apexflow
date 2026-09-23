@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import shutil
 from pathlib import Path
 import tempfile
 from typing import Mapping
@@ -39,6 +40,7 @@ def write_run_manifest(output_dir: str | Path, manifest: dict) -> None:
             json.dump(manifest, handle, ensure_ascii=False, indent=2, allow_nan=False)
             handle.write("\n")
         except Exception:
+            handle.close()
             temporary.unlink(missing_ok=True)
             raise
     try:
@@ -50,6 +52,8 @@ def write_run_manifest(output_dir: str | Path, manifest: dict) -> None:
 def validate_run_manifest(data_dir: str | Path, output_dir: str | Path) -> dict:
     """Reject unfinished runs and CSVs calculated from a different input snapshot."""
     try:
+        if (Path(output_dir) / ".pipeline.lock").exists():
+            raise ValueError("Pipeline выполняется или оставил lock после сбоя")
         manifest = json.loads((Path(output_dir) / RUN_MANIFEST).read_text(encoding="utf-8"))
         if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or manifest.get("status") != "complete":
             raise ValueError("Последний расчёт не завершён успешно. Выполните pipeline заново.")
@@ -185,7 +189,7 @@ def _validate_aggregation(edges: pd.DataFrame, transactions: pd.DataFrame) -> No
 
 
 def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
-    if set(results) != set(OUTPUT_COLUMNS):
+    if not isinstance(results, Mapping) or set(results) != set(OUTPUT_COLUMNS):
         raise ValueError(f"analyze должен вернуть ровно ключи: {', '.join(OUTPUT_COLUMNS)}")
     for name, columns in OUTPUT_COLUMNS.items():
         frame = results[name]
@@ -283,11 +287,30 @@ def write_outputs(results: Mapping[str, pd.DataFrame], output_dir: str | Path) -
             reread = pd.read_csv(temporary, dtype=str, keep_default_na=False)
             if list(reread.columns) != columns or len(reread) != len(results[name]):
                 raise ValueError(f"Не удалось повторно прочитать {name}.csv")
-            for column in ("gid", "cluster_id", "evidence", "why", "top_gids", "hypothesis"):
-                if column in columns and reread[column].tolist() != results[name][column].map(str).tolist():
+            for column in columns:
+                if reread[column].tolist() != results[name][column].map(str).tolist():
                     raise ValueError(f"При записи {name}.{column} потеряны значения")
-        for temporary, target in temp_paths:
-            temporary.replace(target)
+        # Roll back handled failures. This is NOT a multi-file atomic transaction:
+        # the UI must remain stopped during publication (see Compose contract).
+        with tempfile.TemporaryDirectory(dir=directory, prefix=".backup-") as backup_dir:
+            backups = {}
+            for _, target in temp_paths:
+                if target.exists():
+                    backup = Path(backup_dir) / target.name
+                    shutil.copy2(target, backup)
+                    backups[target] = backup
+            published = []
+            try:
+                for temporary, target in temp_paths:
+                    temporary.replace(target)
+                    published.append(target)
+            except OSError:
+                for target in reversed(published):
+                    if target in backups:
+                        shutil.copy2(backups[target], target)
+                    else:
+                        target.unlink(missing_ok=True)
+                raise
     finally:
         for temporary, _ in temp_paths:
             temporary.unlink(missing_ok=True)
