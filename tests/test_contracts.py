@@ -62,6 +62,8 @@ def test_small_samples_use_minimum_of_twenty_and_node_count(n):
     ("clusters", "top_gids", "[true]"),
     ("clusters", "top_gids", "[[1]]"),
     ("clusters", "top_gids", "[2,1]"),
+    ("clusters", "top_gids", "[]"),
+    ("clusters", "top_gids", "[1,2,3,4,5,6]"),
     ("top_nodes", "why", None),
 ])
 def test_invalid_outputs_fail_closed(table, column, value):
@@ -89,3 +91,55 @@ def test_unsorted_roles_are_rejected_before_publication():
     results["nodes_roles"] = results["nodes_roles"].iloc[::-1]
     with pytest.raises(ValueError, match="отсортированы"):
         validate_outputs(results, nodes, edges)
+
+
+@pytest.mark.parametrize("value", [-1.0, complex(1, 1), float("inf"), float("nan")])
+@pytest.mark.parametrize("table", ["edges", "transactions"])
+def test_invalid_money_is_rejected(table, value):
+    nodes, edges, transactions = sample_inputs()
+    frame = edges if table == "edges" else transactions
+    frame["sum_kzt"] = value
+    with pytest.raises(ValueError):
+        validate_inputs(nodes, edges, transactions)
+
+
+def test_integer_turnover_cannot_overflow_during_reconciliation():
+    nodes, edges, transactions = sample_inputs(2)
+    transactions = pd.concat([transactions, transactions], ignore_index=True)
+    transactions["sum_kzt"] = pd.Series([6 * 10**18, 6 * 10**18], dtype="int64")
+    edges["sum_kzt"] = 1.2e19
+    edges["n_tx"] = 2
+    validate_inputs(nodes, edges, transactions)
+    results = sample_results(nodes)
+    results["clusters"]["sum_kzt_internal"] = 1.2e19
+    validate_outputs(results, nodes, edges)
+
+
+def test_large_turnover_tolerance_is_roundoff_not_percentage():
+    nodes, edges, transactions = sample_inputs(2)
+    transactions["sum_kzt"] = 1e15
+    edges["sum_kzt"] = 1e15 + 1000
+    with pytest.raises(ValueError, match="агрегированными"):
+        validate_inputs(nodes, edges, transactions)
+    edges["sum_kzt"] = 1e15
+    results = sample_results(nodes)
+    results["clusters"]["sum_kzt_internal"] = 1e15 + 1000
+    with pytest.raises(ValueError, match="внутренними"):
+        validate_outputs(results, nodes, edges)
+
+
+def test_cluster_reconciliation_sums_int64_edges_without_overflow():
+    nodes, edges, transactions = sample_inputs(3)
+    edges["sum_kzt"] = pd.Series([6 * 10**18, 6 * 10**18], dtype="int64")
+    transactions["sum_kzt"] = edges["sum_kzt"]
+    validate_inputs(nodes, edges, transactions)
+    results = sample_results(nodes)
+    results["clusters"]["sum_kzt_internal"] = 1.2e19
+    validate_outputs(results, nodes, edges)
+
+
+def test_total_money_overflow_is_rejected():
+    nodes, edges, transactions = sample_inputs(3)
+    edges["sum_kzt"] = 1e308
+    with pytest.raises(ValueError, match="Суммарный оборот"):
+        validate_inputs(nodes, edges, transactions)
