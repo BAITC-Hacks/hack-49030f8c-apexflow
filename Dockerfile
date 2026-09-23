@@ -13,5 +13,8 @@ CMD ["pytest", "-q", "-o", "cache_dir=/tmp/apexflow-pytest-cache"]
 USER apexflow
 
 FROM base AS runtime
+ARG APEXFLOW_REVISION=unknown
+ENV APEXFLOW_REVISION=${APEXFLOW_REVISION}
+LABEL org.opencontainers.image.revision=${APEXFLOW_REVISION}
 USER apexflow
 CMD ["python", "-m", "apexflow", "--data", "/app/data", "--output", "/app/output"]

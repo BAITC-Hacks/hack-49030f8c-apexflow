@@ -15,5 +15,9 @@ __pycache__
 **/*.parquet
 data
 output
+nodes_roles.csv
+clusters.csv
+top_nodes.csv
 *.pdf
 docs
+.ci

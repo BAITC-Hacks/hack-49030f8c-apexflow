@@ -8,4 +8,8 @@ __pycache__/
 *.key
 data/
 output/
+/nodes_roles.csv
+/clusters.csv
+/top_nodes.csv
 *.parquet
+.ci/
