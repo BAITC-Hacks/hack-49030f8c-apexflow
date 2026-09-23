@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="ApexFlow — статическая демонстрация исследования транзакционной сети для AML-аналитика.">
+    <title>ApexFlow — AML investigation workspace</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="ApexFlow, к началу страницы">
+        <span class="brand-mark" aria-hidden="true">◈</span>
+        <span>ApexFlow</span>
+      </a>
+      <span class="header-note">AML investigation workspace</span>
+      <a class="github-link" href="https://github.com/BAITC-Hacks/hack-49030f8c-apexflow">Исходный код ↗</a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">Объяснимый графовый baseline</p>
+        <h1 id="page-title">От очереди проверки<br>к наблюдаемым связям</h1>
+        <p class="hero-copy">ApexFlow помогает AML-аналитику выбрать следующий узел для проверки, увидеть его окружение и не потерять ограничения исходной выборки.</p>
+        <a class="button button-primary" href="#workspace">Открыть демонстрацию <span aria-hidden="true">↓</span></a>
+      </section>
+
+      <section class="notice" aria-label="Статус демонстрации">
+        <span class="notice-icon" aria-hidden="true">i</span>
+        <div>
+          <strong>Публичная статическая демонстрация</strong>
+          <p>Страница работает на искусственном наборе и не публикует исходные банковские данные. Полная версия с pipeline и реальными CSV запускается локально через Docker.</p>
+        </div>
+      </section>
+
+      <section id="workspace" class="workspace" aria-labelledby="workspace-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Демонстрационный экран</p>
+            <h2 id="workspace-title">Рабочее место аналитика</h2>
+          </div>
+          <p class="source-label">Синтетический набор · не результат анализа</p>
+        </div>
+
+        <div class="metrics" aria-label="Сводка сети">
+          <article><span>Узлов</span><strong id="node-count">—</strong></article>
+          <article><span>Наблюдаемых рёбер</span><strong id="edge-count">—</strong></article>
+          <article><span>Seed</span><strong id="seed-count">—</strong></article>
+          <article><span>Кластеров</span><strong id="cluster-count">—</strong></article>
+        </div>
+
+        <div class="controls" aria-label="Поиск и фильтрация">
+          <label class="search-control" for="gid-search">
+            <span>Поиск по gid</span>
+            <input id="gid-search" inputmode="numeric" autocomplete="off" placeholder="Введите полный целочисленный идентификатор">
+          </label>
+          <button id="search-button" class="button button-primary">Найти клиента</button>
+          <label for="role-filter"><span>Роль в топе</span><select id="role-filter"></select></label>
+          <label for="cluster-filter"><span>Кластер в топе</span><select id="cluster-filter"></select></label>
+        </div>
+        <p id="search-message" class="search-message" role="status" aria-live="polite"></p>
+
+        <div class="dashboard-grid">
+          <section class="panel queue-panel" aria-labelledby="queue-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Очередь проверки</p>
+                <h3 id="queue-title">Глобальный топ</h3>
+              </div>
+              <span id="top-count" class="counter"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Ранг</th><th>gid</th><th>Роль</th><th>Приоритет</th></tr></thead>
+                <tbody id="top-table"></tbody>
+              </table>
+            </div>
+            <p class="panel-footnote">Фильтры изменяют только таблицу. Поиск всегда идёт по полному набору.</p>
+          </section>
+
+          <section class="panel case-panel" aria-labelledby="case-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Карточка клиента</p>
+                <h3 id="case-title">gid <span id="selected-gid">—</span></h3>
+              </div>
+              <span id="role-badge" class="role-badge"></span>
+            </div>
+            <p id="evidence" class="evidence"></p>
+            <dl class="case-metrics">
+              <div><dt>Поддержка роли</dt><dd id="role-score">—</dd></div>
+              <div><dt>Приоритет проверки</dt><dd id="priority-score">—</dd></div>
+              <div><dt>Кластер</dt><dd id="cluster-id">—</dd></div>
+              <div><dt>Depth / seed</dt><dd id="depth-seed">—</dd></div>
+            </dl>
+            <p class="score-note">Score показывает поддержку эвристической гипотезы и порядок проверки, а не вероятность виновности.</p>
+            <div class="investigation-note">
+              <h4>Ограничение и следующий шаг</h4>
+              <p id="next-step">—</p>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel graph-panel" aria-labelledby="graph-title">
+          <div class="panel-heading graph-heading">
+            <div>
+              <p class="eyebrow">Наблюдаемые связи</p>
+              <h3 id="graph-title">Направленное окружение</h3>
+            </div>
+            <div class="legend" aria-label="Легенда графа">
+              <span><i class="selected-dot"></i> выбранный узел</span>
+              <span><i class="seed-dot"></i> seed</span>
+              <span>стрелка: src → dst</span>
+            </div>
+          </div>
+          <svg id="network" viewBox="0 0 960 420" role="img" aria-label="Направленный граф выбранного окружения"></svg>
+          <p id="graph-caption" class="panel-footnote"></p>
+        </section>
+
+        <div class="dashboard-grid lower-grid">
+          <section class="panel" aria-labelledby="edges-title">
+            <div class="panel-heading"><div><p class="eyebrow">Проверяемые факты</p><h3 id="edges-title">Связи выбранного узла</h3></div></div>
+            <div class="edge-tables">
+              <div><h4>Входящие</h4><div id="incoming"></div></div>
+              <div><h4>Исходящие</h4><div id="outgoing"></div></div>
+            </div>
+          </section>
+          <section class="panel" aria-labelledby="clusters-title">
+            <div class="panel-heading"><div><p class="eyebrow">Контекст</p><h3 id="clusters-title">Кластеры и выгрузки</h3></div></div>
+            <div id="cluster-summary" class="cluster-summary"></div>
+            <div class="download-row">
+              <button data-download="nodes_roles" class="button button-secondary">nodes_roles.csv</button>
+              <button data-download="clusters" class="button button-secondary">clusters.csv</button>
+              <button data-download="top_nodes" class="button button-secondary">top_nodes.csv</button>
+            </div>
+            <p class="panel-footnote">Выгрузки синтетические и предназначены только для демонстрации интерфейса.</p>
+          </section>
+        </div>
+      </section>
+
+      <section class="principles" aria-labelledby="principles-title">
+        <p class="eyebrow">Принципы прототипа</p>
+        <h2 id="principles-title">Проверяемая гипотеза, а не автоматическое решение</h2>
+        <div class="principle-grid">
+          <article><span>01</span><h3>Наблюдаемая сеть</h3><p>Связи и суммы остаются проверяемыми в исходной выгрузке.</p></article>
+          <article><span>02</span><h3>Честные ограничения</h3><p>Граница depth=4 и неполные входящие seed явно влияют на трактовку результата.</p></article>
+          <article><span>03</span><h3>Решение за экспертом</h3><p>Система формирует очередь и объяснение, а дальнейшую проверку проводит аналитик.</p></article>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>© ApexFlow · HackAlem AI</span>
+      <a href="https://github.com/BAITC-Hacks/hack-49030f8c-apexflow">GitHub repository ↗</a>
+    </footer>
+    <script src="app.js"></script>
+  </body>
+</html>
