@@ -138,6 +138,18 @@ def test_depth_four_never_receives_terminal_role() -> None:
     assert "Depth=4" in roles.loc[99, "evidence"]
 
 
+def test_cluster_hypothesis_preserves_terminal_candidate_and_observation_limit():
+    nodes, edges = _frames([(1, 0, True), (2, 1, False)], [(1, 2, 100, 1)])
+    result = analyze(nodes, edges, _transactions())
+    _assert_contract(result, nodes, edges)
+    assert result["nodes_roles"].set_index("gid").loc[2, "role"] == "terminal"
+    hypothesis = result["clusters"].iloc[0].hypothesis
+    assert "кандидат на конечного получателя" in hypothesis
+    assert "в выборке" in hypothesis
+    assert "проверьте дальнейшие исходящие" in hypothesis
+    assert "без достаточных признаков" not in hypothesis
+
+
 @pytest.mark.parametrize("count", [0, 1, 4])
 def test_empty_or_edgeless_graph_keeps_every_node(count):
     nodes, edges = _frames([(i, 0, True) for i in range(count)], [])
@@ -161,6 +173,7 @@ def test_self_transfers_do_not_prove_transit_and_are_not_hidden(zero_money):
     assert "Самопереводы" in row.evidence
     assert "нет входящих" not in row.evidence
     assert "Изолированный" not in result["clusters"].iloc[0].hypothesis
+    assert "Одиночный кластер" in result["clusters"].iloc[0].hypothesis
 
 
 def test_zero_weight_projection_does_not_crash_or_invent_monetary_communities():
@@ -169,6 +182,7 @@ def test_zero_weight_projection_does_not_crash_or_invent_monetary_communities():
     _assert_contract(result, nodes, edges)
     assert len(result["clusters"]) == 3
     assert result["nodes_roles"].role.eq("peripheral").all()
+    assert result["clusters"].hypothesis.str.contains("Одиночный кластер", regex=False).all()
     features = compute_features(nodes, edges)
     assert features.in_sum.eq(0).all()
     assert features.flow_ratio.isna().all()
@@ -265,6 +279,7 @@ def test_coordinator_score_uses_positive_q95_and_role_precedence():
     row = assign_roles(features).set_index("gid").loc[3]
     assert row.role == "coordinator"  # Also satisfies distributor and transit.
     assert row.role_score == pytest.approx(1.0)
+    assert "Достижим из 2 seed" in make_evidence(row)
     # Without two reachable seeds, the same node becomes distributor, not transit.
     features["n_seed_reachable"] = 1
     assert assign_roles(features).set_index("gid").loc[3, "role"] == "distributor"
@@ -405,6 +420,21 @@ def test_priority_explanation_uses_largest_actual_contributions():
     assert "оборот" not in text
     assert text.index("центральность") < text.index("9 seed") < text.index("4 контрагентов")
     assert "1e-05" in text  # A positive metric must not be displayed as zero.
+
+
+def test_zero_priority_does_not_deny_roles_in_a_symmetric_money_cycle():
+    nodes, edges = _frames(
+        [(i, 1, False) for i in range(1, 4)],
+        [(1, 2, 100_000, 1), (2, 3, 100_000, 1), (3, 1, 100_000, 1)],
+    )
+    result = analyze(nodes, edges, _transactions())
+    _assert_contract(result, nodes, edges)
+    assert result["nodes_roles"].role.eq("transit").all()
+    assert result["nodes_roles"].priority_score.eq(0).all()
+    assert result["top_nodes"].gid.tolist() == [1, 2, 3]
+    assert result["top_nodes"].why.str.contains("нормализации", regex=False).all()
+    assert result["top_nodes"].why.str.contains("порядок по gid", regex=False).all()
+    assert not result["top_nodes"].why.str.contains("Нет выраженных", regex=False).any()
 
 
 def test_money_summation_is_independent_of_input_order():

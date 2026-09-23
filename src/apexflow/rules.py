@@ -184,8 +184,8 @@ def make_evidence(row: pd.Series) -> str:
     role = row["role"]
     if role == "coordinator":
         text = (
-            f"Связывает {int(row['n_seed_reachable'])} seed-направления и "
-            f"{int(row['neighbor_cluster_count'])} соседних кластеров; "
+            f"Достижим из {int(row['n_seed_reachable'])} seed; "
+            f"соседних кластеров {int(row['neighbor_cluster_count'])}; "
             f"центральность {row['betweenness']:.3g}."
         )
     elif role == "distributor":
@@ -242,5 +242,8 @@ def make_priority_why(row: pd.Series) -> str:
     ranked = sorted(observations, key=lambda key: -row[key])
     parts = [observations[key] for key in ranked if row[key] > 0][:3]
     if not parts:
-        return "Нет выраженных структурных сигналов; позиция определена стабильным порядком."
+        return (
+            "Приоритет 0: метрики не дают положительного вклада после нормализации; "
+            "при равном score порядок по gid."
+        )
     return _bounded("Приоритет: " + "; ".join(parts) + ".")
