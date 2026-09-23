@@ -93,7 +93,7 @@ import { roles, canonicalGid, rankNodes, csvFor, selectGraph, edgePath, clusterC
     const restrictions = [];
     const nextSteps = [];
     if (node.depth === 4) { restrictions.push("Выборка обрывается на четвёртом колене."); nextSteps.push("Запросить последующие исходящие операции за пределами глубины текущей выгрузки."); }
-    if (node.isSeed) { restrictions.push("Входящие операции до начала выборки могут быть неполными."); nextSteps.push("Уточнить входящие операции, предшествующие текущей выборке."); }
+    if (node.isSeed) { restrictions.push("Входящие операции извне наблюдаемого графа могут быть неполными даже за тот же период."); nextSteps.push("Запросить полные входящие операции за наблюдаемый период, включая плательщиков вне выгруженного графа."); }
     if (!incoming.length && !outgoing.length) {
       restrictions.push("Наблюдаемых связей нет.");
       nextSteps.push("Уточнить полноту выгрузки и наличие операций вне наблюдаемого периода.");
