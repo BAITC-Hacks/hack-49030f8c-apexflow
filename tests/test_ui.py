@@ -234,6 +234,8 @@ def test_streamlit_search_survives_filter_and_missing_files(tmp_path, monkeypatc
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run(timeout=20)
     assert not app.exception
     assert len(app.error) == 1
+    assert any("исходные Parquet" in item.value for item in app.info)
+    assert not any("интегрированный модуль аналитики" in item.value for item in app.info)
     app.toggle[0].set_value(True).run(timeout=20)
     assert not app.exception
     role = next(element for element in app.selectbox if element.label == "Роль в таблице топа")

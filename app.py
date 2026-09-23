@@ -110,7 +110,7 @@ def _load_selected_data(use_synthetic: bool) -> ViewData | None:
         st.info(
             "Дождитесь успешного pipeline и обновите данные. "
             "Повторный расчёт: docker compose down, затем docker compose up --build --force-recreate. "
-            "Для расчёта нужны исходные Parquet и интегрированный модуль аналитики."
+            "Для расчёта нужны исходные Parquet в каталоге data."
         )
         return None
 
