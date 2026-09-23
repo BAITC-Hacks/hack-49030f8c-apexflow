@@ -7,12 +7,14 @@ only displays those results and the observed source edges.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from apexflow.io import validate_run_manifest
 
 from ui.data import (
     ROLE_LABELS,
@@ -97,9 +99,12 @@ def _load_selected_data(use_synthetic: bool) -> ViewData | None:
         )
         return synthetic_view_data()
     try:
+        # Recheck even on a cache hit: failed runs and replaced inputs must not
+        # leave the previous results looking current on the next interaction.
+        validate_run_manifest(DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR)
         signature = file_signature(DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR)
         return _load_cached(DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR, signature)
-    except ViewDataError as error:
+    except ValueError as error:
         st.error("Результаты расчёта пока недоступны или не проходят проверку данных.")
         st.code(str(error), language=None)
         st.info(
@@ -195,8 +200,8 @@ def _render_node_card(data: ViewData, node: pd.Series) -> None:
     recipients = outbound.loc[outbound["_dst_key"] != selected_gid, "_dst_key"].nunique()
     st.markdown(
         "**Наблюдаемые связи:** "
-        f"{payers} внешних плательщиков, вход {_format_kzt(inbound['sum_kzt'].sum())}; "
-        f"{recipients} внешних получателей, выход {_format_kzt(outbound['sum_kzt'].sum())}. "
+        f"{payers} внешних плательщиков, вход {_format_kzt(math.fsum(float(x) for x in inbound['sum_kzt']))}; "
+        f"{recipients} внешних получателей, выход {_format_kzt(math.fsum(float(x) for x in outbound['sum_kzt']))}. "
         "Переводы самому себе включены в суммы, но не в число внешних контрагентов."
     )
 
@@ -213,10 +218,15 @@ def _render_node_card(data: ViewData, node: pd.Series) -> None:
     if inbound.empty and outbound.empty:
         limitations.append("Наблюдаемых связей нет; это не является ошибкой визуализации.")
         steps.append("Уточнить полноту выгрузки и наличие операций вне наблюдаемого периода.")
-    if node["role"] == "transit":
-        steps.append("Сопоставить даты доступных входящих и исходящих операций перед выводом о последовательности потоков.")
-    if not steps:
-        steps.append("Проверить показанные операции и принять решение об углублённой проверке у специалиста.")
+    role_steps = {
+        "consolidator": "Сверить крупнейших входящих плательщиков и концентрацию поступлений; проверить объяснение объединения средств по доступным сведениям банка.",
+        "distributor": "Сверить крупнейших получателей и распределение исходящих сумм; проверить назначение переводов по доступным сведениям банка.",
+        "transit": "Сопоставить даты доступных входящих и исходящих операций перед выводом о последовательности потоков.",
+        "terminal": "Проверить более поздние исходящие операции и полноту периода; наблюдаемое удержание не подтверждает конечного бенефициара.",
+        "coordinator": "Проверить наблюдаемые связи между группами и seed-направлениями; структурное положение само по себе не доказывает управление сетью.",
+        "peripheral": "Сопоставить доступные операции и полноту наблюдения; слабые графовые признаки сами по себе не исключают необходимость проверки.",
+    }
+    steps.append(role_steps[node["role"]])
     if limitations:
         st.warning("Ограничения наблюдения: " + " ".join(limitations), icon="ℹ️")
     st.markdown("**Следующий шаг аналитика**")
@@ -273,8 +283,16 @@ def _render_graph(data: ViewData, selected_gid: str) -> None:
     st.caption("Тёмная рамка — выбранный узел; внешняя пунктирная рамка — seed. В подсказке указан depth. Цвета кластеров могут повторяться: сверяйте номер.")
 
 
-def _render_clusters_and_downloads(data: ViewData) -> None:
+def _render_clusters_and_downloads(data: ViewData, selected_gid: str) -> None:
     st.subheader("Кластеры и выгрузки")
+    node = find_node(data, selected_gid)
+    current_cluster = data.clusters.loc[data.clusters["_cluster_key"] == node["_cluster_key"]].iloc[0]
+    st.markdown(f"**Кластер выбранного клиента: {current_cluster['cluster_id']}**")
+    size, seeds, turnover = st.columns(3)
+    size.metric("Узлов в выбранном кластере", int(current_cluster["n_nodes"]))
+    seeds.metric("Seed в выбранном кластере", int(current_cluster["n_seed"]))
+    turnover.metric("Внутренний оборот", _format_kzt(current_cluster["sum_kzt_internal"]))
+    st.text(str(current_cluster["hypothesis"]))
     cluster_display = data.clusters[
         ["cluster_id", "n_nodes", "n_seed", "sum_kzt_internal", "top_gids", "hypothesis"]
     ].rename(
@@ -289,11 +307,15 @@ def _render_clusters_and_downloads(data: ViewData) -> None:
     )
     st.dataframe(cluster_display, hide_index=True, use_container_width=True)
     selected_cluster = st.selectbox(
-        "Посмотреть top_gids кластера",
+        "Просмотреть другой кластер",
         options=list(data.clusters["_cluster_key"]),
         format_func=lambda key: f"Кластер {data.clusters.loc[data.clusters['_cluster_key'] == key, 'cluster_id'].iloc[0]}",
+        index=list(data.clusters["_cluster_key"]).index(str(current_cluster["_cluster_key"])),
+        key=f"cluster_browser_{selected_gid}",
     )
     cluster = data.clusters.loc[data.clusters["_cluster_key"] == selected_cluster].iloc[0]
+    st.caption(f"Просматриваемый кластер {cluster['cluster_id']}: {cluster['n_nodes']} узлов; {cluster['n_seed']} seed; {_format_kzt(cluster['sum_kzt_internal'])} внутри группы.")
+    st.text(str(cluster["hypothesis"]))
     gids = _parse_top_gids(cluster["top_gids"])
     if gids:
         cluster_gid = st.selectbox("Открыть gid кластера", options=gids)
@@ -341,6 +363,7 @@ def main() -> None:
     stats[2].metric("Seed", int(data.nodes_roles["is_seed"].astype(bool).sum()))
     stats[3].metric("Кластеров", len(data.clusters))
     st.caption(data.source)
+    st.caption(data.period)
 
     _render_search(data)
     selected_gid = str(st.session_state["selected_gid"])
@@ -369,7 +392,7 @@ def main() -> None:
     with card_column:
         _render_node_card(data, node)
     _render_edge_tables(data, selected_gid)
-    _render_clusters_and_downloads(data)
+    _render_clusters_and_downloads(data, selected_gid)
 
 
 if __name__ == "__main__":
