@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 import json
+import math
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,7 +15,7 @@ from streamlit.testing.v1 import AppTest
 from apexflow.io import INPUT_FILES, OUTPUT_COLUMNS, file_hashes, write_run_manifest
 
 from ui.data import ViewDataError, find_node, parse_gid, synthetic_view_data, load_view_data, file_signature
-from ui.graph import build_subgraph, render_svg
+from ui.graph import build_subgraph, render_svg, render_legend
 
 
 def _complete_manifest(data_dir, output):
@@ -181,6 +183,50 @@ def test_reciprocal_edges_and_self_loop_have_visible_paths():
     assert ' C ' in svg  # nondegenerate self loop
     assert svg.count('marker-end=') == 6
     assert "Признаки консолидации" in svg
+
+
+def test_limited_neighborhood_does_not_make_hidden_neighbors_look_isolated():
+    data = synthetic_view_data()
+    gid = "10000000000000002"
+    subset = build_subgraph(data.nodes_roles, data.edges, gid, max_edges=1)
+    endpoints = set(subset.edges["_src_key"]) | set(subset.edges["_dst_key"])
+    assert set(subset.nodes["_gid_key"]) == endpoints | {gid}
+    all_neighbors = data.edges.loc[(data.edges["_src_key"] == gid) | (data.edges["_dst_key"] == gid)]
+    all_keys = set(all_neighbors["_src_key"]) | set(all_neighbors["_dst_key"])
+    assert subset.hidden_nodes == len(all_keys - endpoints)
+    assert subset.hidden_nodes > 0
+
+
+def test_dense_neighborhood_has_centered_selection_separate_nodes_and_short_labels():
+    data = synthetic_view_data()
+    template = data.nodes_roles.iloc[0].to_dict()
+    gids = [str(100000000000000000 + index) for index in range(40)]
+    nodes = pd.DataFrame([{**template, "gid": gid, "_gid_key": gid, "is_seed": True} for gid in gids])
+    edges = pd.DataFrame([
+        {"src": gids[0], "dst": gid, "_src_key": gids[0], "_dst_key": gid, "sum_kzt": 1, "n_tx": 1}
+        for gid in gids[1:]
+    ])
+    subset = build_subgraph(nodes, edges, gids[0], max_edges=40)
+    root = ET.fromstring(render_svg(subset, gids[0]))
+    ns = {"svg": "http://www.w3.org/2000/svg"}
+    groups = root.findall("svg:g", ns)
+    assert len(groups) == 40
+    geometry = []
+    for index, group in enumerate(groups, start=1):
+        circle = group.find("svg:circle", ns)
+        x, y, radius = (float(circle.attrib[key]) for key in ("cx", "cy", "r"))
+        geometry.append((x, y, radius))
+        assert group.find("svg:text", ns).text == f"№{index}"
+        assert f"gid: {group.attrib['data-gid']}" in group.find("svg:title", ns).text
+        if group.attrib["data-gid"] == gids[0]:
+            assert (x, y) == (450, 260)
+            assert circle.attrib["stroke-width"] == "5"
+        assert radius < 15  # The former radius29 overlaps in the dense graph.
+    for index, (x, y, radius) in enumerate(geometry):
+        for other_x, other_y, other_radius in geometry[index + 1:]:
+            assert math.hypot(x - other_x, y - other_y) > radius + other_radius + 16
+    assert "не gid" in render_legend(subset, "role")
+    assert root.findall("svg:path", ns)[0].attrib["data-src"] == gids[0]
 
 
 def test_streamlit_search_survives_filter_and_missing_files(tmp_path, monkeypatch):
