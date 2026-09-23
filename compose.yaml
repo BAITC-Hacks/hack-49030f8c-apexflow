@@ -1,25 +1,23 @@
+x-runtime: &runtime
+  image: apexflow:${APEXFLOW_IMAGE_TAG:-local}
+  build:
+    context: .
+    target: runtime
+    args:
+      APEXFLOW_REVISION: ${APEXFLOW_REVISION:-unknown}
+
 services:
   pipeline:
-    image: apexflow:${APEXFLOW_IMAGE_TAG:-local}
-    build:
-      context: .
-      target: runtime
-      args:
-        APEXFLOW_REVISION: ${APEXFLOW_REVISION:-unknown}
+    <<: *runtime
     command: python -m apexflow --data /app/data --output /app/output
     user: "${APEXFLOW_UID:-10001}:${APEXFLOW_GID:-10001}"
-    network_mode: none
     volumes:
       - ${APEXFLOW_DATA_DIR:-./data}:/app/data:ro
       - ${APEXFLOW_OUTPUT_DIR:-./output}:/app/output
+    network_mode: none
 
   ui:
-    image: apexflow:${APEXFLOW_IMAGE_TAG:-local}
-    build:
-      context: .
-      target: runtime
-      args:
-        APEXFLOW_REVISION: ${APEXFLOW_REVISION:-unknown}
+    <<: *runtime
     command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501
     user: "${APEXFLOW_UID:-10001}:${APEXFLOW_GID:-10001}"
     depends_on:
@@ -29,7 +27,7 @@ services:
       - ${APEXFLOW_DATA_DIR:-./data}:/app/data:ro
       - ${APEXFLOW_OUTPUT_DIR:-./output}:/app/output:ro
     ports:
-      - "127.0.0.1:8501:8501"
+      - "127.0.0.1:${APEXFLOW_PORT:-8501}:8501"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"]
       interval: 10s
@@ -40,5 +38,8 @@ services:
     build:
       context: .
       target: test
+      args:
+        APEXFLOW_REVISION: ${APEXFLOW_REVISION:-unknown}
+    user: "${APEXFLOW_UID:-10001}:${APEXFLOW_GID:-10001}"
     profiles: ["test"]
     network_mode: none
