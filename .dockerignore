@@ -17,3 +17,7 @@ data
 output
 *.pdf
 docs
+.ci
+.artifacts
+*.zip
+.DS_Store

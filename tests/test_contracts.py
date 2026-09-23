@@ -89,3 +89,33 @@ def test_unsorted_roles_are_rejected_before_publication():
     results["nodes_roles"] = results["nodes_roles"].iloc[::-1]
     with pytest.raises(ValueError, match="отсортированы"):
         validate_outputs(results, nodes, edges)
+
+
+def test_aggregation_does_not_wrap_int64():
+    nodes, edges, transactions = sample_inputs(2)
+    transactions = pd.concat([transactions, transactions], ignore_index=True)
+    transactions["sum_kzt"] = pd.Series([2**62, 2**62], dtype="int64")
+    edges["sum_kzt"] = float(2**63)
+    edges["n_tx"] = 2
+    validate_inputs(nodes, edges, transactions)
+    results = sample_results(nodes)
+    results["clusters"]["sum_kzt_internal"] = float(2**63)
+    validate_outputs(results, nodes, edges)
+
+
+def test_negative_transactions_are_not_hidden_by_net_aggregation():
+    nodes, edges, transactions = sample_inputs(2)
+    transactions = pd.concat([transactions, transactions], ignore_index=True)
+    transactions["sum_kzt"] = [150.0, -50.0]
+    edges["n_tx"] = 2
+    with pytest.raises(ValueError, match="отрицательные"):
+        validate_inputs(nodes, edges, transactions)
+
+
+@pytest.mark.parametrize("value", ["[]", "[1,2,3,4,5,6]"])
+def test_cluster_top_size_is_bounded(value):
+    nodes, edges, _ = sample_inputs()
+    results = sample_results(nodes)
+    results["clusters"]["top_gids"] = value
+    with pytest.raises(ValueError):
+        validate_outputs(results, nodes, edges)

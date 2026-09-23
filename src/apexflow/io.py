@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Mapping
 
@@ -74,6 +75,8 @@ def validate_graph_inputs(nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
         if not frame["depth"].between(0, 4).all():
             raise ValueError(f"{name}.depth содержит значения вне диапазона 0..4")
     _finite_column(edges, "sum_kzt", "edges")
+    if edges["sum_kzt"].lt(0).any():
+        raise ValueError("edges.sum_kzt: отрицательные суммы не поддерживаются аналитикой")
     _validate_endpoints(nodes, edges, "edges")
     if edges.duplicated(["src", "dst"]).any():
         raise ValueError("edges содержит повторные направленные пары; выясните источник")
@@ -91,6 +94,8 @@ def validate_inputs(nodes: pd.DataFrame, edges: pd.DataFrame, transactions: pd.D
     for column in ("src", "dst"):
         _integer_column(transactions, column, "transactions")
     _finite_column(transactions, "sum_kzt", "transactions")
+    if transactions["sum_kzt"].lt(0).any():
+        raise ValueError("transactions.sum_kzt: отрицательные суммы не поддерживаются аналитикой")
     if not transactions.empty and pd.api.types.is_numeric_dtype(transactions["date"]):
         raise ValueError("transactions.date должен содержать даты, а не числовые метки без единиц")
     dates = pd.to_datetime(transactions["date"], errors="coerce")
@@ -101,19 +106,23 @@ def validate_inputs(nodes: pd.DataFrame, edges: pd.DataFrame, transactions: pd.D
 
 
 def _validate_aggregation(edges: pd.DataFrame, transactions: pd.DataFrame) -> None:
-    actual = transactions.groupby(["src", "dst"], as_index=False).agg(sum_kzt=("sum_kzt", "sum"), n_tx=("sum_kzt", "size"))
+    # Convert before summation: pandas integer groupby can silently wrap int64.
+    amounts = transactions.assign(sum_kzt=transactions["sum_kzt"].astype(float))
+    actual = amounts.groupby(["src", "dst"], as_index=False).agg(sum_kzt=("sum_kzt", "sum"), n_tx=("sum_kzt", "size"))
+    _finite_column(actual, "sum_kzt", "aggregated transactions")
     expected = edges[["src", "dst", "sum_kzt", "n_tx"]]
     merged = expected.merge(actual, on=["src", "dst"], how="outer", suffixes=("_edge", "_tx"), indicator=True)
     if not (merged["_merge"] == "both").all():
         raise ValueError("Пары edges и агрегированные transactions не совпадают")
     if not (merged["n_tx_edge"] == merged["n_tx_tx"]).all():
         raise ValueError("n_tx в edges не совпадает с количеством transactions")
-    if not (merged["sum_kzt_edge"] - merged["sum_kzt_tx"]).abs().le(1e-9).all():
+    if not all(math.isclose(float(a), float(b), rel_tol=1e-12, abs_tol=1e-9)
+               for a, b in zip(merged["sum_kzt_edge"], merged["sum_kzt_tx"])):
         raise ValueError("sum_kzt в edges не совпадает с агрегированными transactions")
 
 
 def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, edges: pd.DataFrame) -> None:
-    if set(results) != set(OUTPUT_COLUMNS):
+    if not isinstance(results, Mapping) or set(results) != set(OUTPUT_COLUMNS):
         raise ValueError(f"analyze должен вернуть ровно ключи: {', '.join(OUTPUT_COLUMNS)}")
     for name, columns in OUTPUT_COLUMNS.items():
         frame = results[name]
@@ -153,7 +162,7 @@ def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, e
         raise ValueError("n_nodes/n_seed в clusters не совпадают с nodes_roles и nodes")
     _finite_column(clusters, "sum_kzt_internal", "clusters")
     lookup = roles.set_index("gid")
-    internal = edges.assign(_src_cluster=edges["src"].map(lookup["cluster_id"]), _dst_cluster=edges["dst"].map(lookup["cluster_id"]))
+    internal = edges.assign(sum_kzt=edges["sum_kzt"].astype(float), _src_cluster=edges["src"].map(lookup["cluster_id"]), _dst_cluster=edges["dst"].map(lookup["cluster_id"]))
     sums = internal.loc[internal["_src_cluster"] == internal["_dst_cluster"]].groupby("_src_cluster")["sum_kzt"].sum()
     for cluster_id, total in actual["sum_kzt_internal"].items():
         if not math.isclose(float(total), float(sums.get(cluster_id, 0)), rel_tol=1e-12, abs_tol=1e-9):
@@ -166,7 +175,7 @@ def validate_outputs(results: Mapping[str, pd.DataFrame], nodes: pd.DataFrame, e
         if not isinstance(gids, list) or any(type(gid) is not int for gid in gids):
             raise ValueError("clusters.top_gids должен быть JSON-массивом целых gid")
         members = roles.loc[roles["cluster_id"] == row["cluster_id"]]
-        if len(set(gids)) != len(gids) or not set(gids).issubset(set(members["gid"])):
+        if not 1 <= len(gids) <= 5 or len(set(gids)) != len(gids) or not set(gids).issubset(set(members["gid"])):
             raise ValueError("clusters.top_gids содержит gid не из своего кластера")
         ordered = members.sort_values(["priority_score", "gid"], ascending=[False, True])["gid"].head(len(gids)).tolist()
         if gids != ordered:
@@ -209,11 +218,30 @@ def write_outputs(results: Mapping[str, pd.DataFrame], output_dir: str | Path) -
             reread = pd.read_csv(temporary, dtype=str, keep_default_na=False)
             if list(reread.columns) != columns or len(reread) != len(results[name]):
                 raise ValueError(f"Не удалось повторно прочитать {name}.csv")
-            for column in ("gid", "cluster_id", "evidence", "why", "top_gids", "hypothesis"):
-                if column in columns and reread[column].tolist() != results[name][column].map(str).tolist():
+            for column in columns:
+                if reread[column].tolist() != results[name][column].map(str).tolist():
                     raise ValueError(f"При записи {name}.{column} потеряны значения")
-        for temporary, target in temp_paths:
-            temporary.replace(target)
+        # Roll back handled failures. This is NOT a multi-file atomic transaction:
+        # the UI must remain stopped during publication (see Compose contract).
+        with tempfile.TemporaryDirectory(dir=directory, prefix=".backup-") as backup_dir:
+            backups = {}
+            for _, target in temp_paths:
+                if target.exists():
+                    backup = Path(backup_dir) / target.name
+                    shutil.copy2(target, backup)
+                    backups[target] = backup
+            published = []
+            try:
+                for temporary, target in temp_paths:
+                    temporary.replace(target)
+                    published.append(target)
+            except OSError:
+                for target in reversed(published):
+                    if target in backups:
+                        shutil.copy2(backups[target], target)
+                    else:
+                        target.unlink(missing_ok=True)
+                raise
     finally:
         for temporary, _ in temp_paths:
             temporary.unlink(missing_ok=True)

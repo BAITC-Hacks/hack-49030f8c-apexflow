@@ -9,3 +9,6 @@ __pycache__/
 data/
 output/
 *.parquet
+.ci/
+.artifacts/
+.DS_Store

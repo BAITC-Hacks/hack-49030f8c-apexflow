@@ -4,23 +4,54 @@ on:
   pull_request:
     branches: [staging, main]
   push:
-    branches: [staging]
+    branches: [staging, 'dev/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   static-demo:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check the synthetic web demo in a container
+        run: docker run --rm --network none -v "$PWD:/work:ro" -w /work node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 sh -c 'node --check site/app.js && node --test tests/test_site.mjs'
+  container-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: apexflow-ci
+      APEXFLOW_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test and run the complete synthetic Compose scenario
+        run: bash tests/compose_smoke.sh
+      - name: Save synthetic-only diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          node-version: '22'
-      - run: node --check site/app.js
-      - run: node --test tests/test_site.mjs
-  compose-and-tests:
+          name: container-integration-${{ github.run_id }}
+          path: .ci/smoke.*/reports/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Ensure containers are stopped
+        if: always()
+        run: docker compose down --remove-orphans
+  release-policy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
-      - name: Build and run contract tests in the test image
-        run: docker compose --profile test run --rm --build tests
+      - name: Require releases to originate from staging
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [ "$BASE" = main ] && [ "$HEAD" != staging ]; then
+            echo 'Release pull requests must use staging as their head branch.' >&2
+            exit 1
+          fi
