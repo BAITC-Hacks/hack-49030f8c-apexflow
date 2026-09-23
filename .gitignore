@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+*.pem
+*.key
+data/
+output/
+/nodes_roles.csv
+/clusters.csv
+/top_nodes.csv
+*.parquet
+.ci/
