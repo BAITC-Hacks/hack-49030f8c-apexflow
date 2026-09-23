@@ -100,6 +100,13 @@ def _series_from_group(
     # Sort before accumulation: floating-point summation must not depend on input
     # row order. Cast amounts before summing to avoid signed integer overflow.
     ordered = frame.sort_values(["src", "dst"]).copy()
+    if value == "n_tx":
+        # Python integers keep exact counts even above the int64 aggregate limit.
+        ordered[value] = ordered[value].astype(object)
+        grouped = ordered.groupby(group, sort=False)[value].sum()
+        return pd.Series(
+            [int(grouped.get(gid, 0)) for gid in gids], index=gids.index, dtype=object
+        )
     ordered[value] = ordered[value].astype(float)
     grouped = ordered.groupby(group, sort=False)[value].sum()
     return gids.map(grouped).fillna(0.0).astype(float)
@@ -151,6 +158,19 @@ def compute_features(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
     result["out_sum"] = _series_from_group(edges, "src", "sum_kzt", result["gid"])
     result["in_n_tx"] = _series_from_group(edges, "dst", "n_tx", result["gid"])
     result["out_n_tx"] = _series_from_group(edges, "src", "n_tx", result["gid"])
+    # Monetary roles need real external flow: self-transfers and zero-value
+    # relationships must not supply their volume or counterparty evidence.
+    result["external_in_sum"] = _series_from_group(
+        external_edges, "dst", "sum_kzt", result["gid"]
+    )
+    result["external_out_sum"] = _series_from_group(
+        external_edges, "src", "sum_kzt", result["gid"]
+    )
+    funded_edges = external_edges.loc[external_edges["sum_kzt"] > 0]
+    for direction, endpoint in (("in", "dst"), ("out", "src")):
+        result[f"funded_{direction}_degree"] = result["gid"].map(
+            funded_edges.groupby(endpoint, sort=False).size()
+        ).fillna(0).astype(int)
 
     neighbors: dict[Any, set[Any]] = defaultdict(set)
     for edge in external_edges[["src", "dst"]].itertuples(index=False):
