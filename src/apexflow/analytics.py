@@ -55,6 +55,12 @@ def assign_clusters(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
         else:
             graph.add_edge(edge["src"], edge["dst"], weight=weight)
 
+    # Louvain uses squared total weights internally. Scaling retains relative
+    # weights and keeps valid tiny/large monetary inputs in a safe numeric range.
+    weight_scale = max((data["weight"] for _, _, data in graph.edges(data=True)), default=1.0)
+    for _, _, data in graph.edges(data=True):
+        data["weight"] /= weight_scale
+
     isolates = sorted(nx.isolates(graph))
     isolate_set = set(isolates)
     connected = graph.subgraph([gid for gid in graph if gid not in isolate_set]).copy()

@@ -16,6 +16,7 @@ from apexflow.analytics import (  # noqa: E402
     NODES_ROLES_COLUMNS,
     TOP_NODES_COLUMNS,
     analyze,
+    assign_clusters,
 )
 from apexflow.features import add_cluster_context, build_graph, compute_features  # noqa: E402
 from apexflow.rules import assign_roles, derive_thresholds, make_evidence, make_priority_why  # noqa: E402
@@ -201,6 +202,38 @@ def test_fan_direction_selects_the_explained_role(direction, role):
     assert result["nodes_roles"].set_index("gid").loc[9, "role"] == role
 
 
+@pytest.mark.parametrize("direction", ["in", "out"])
+def test_zero_value_fan_and_large_self_loop_do_not_prove_a_money_flow_role(direction):
+    rows = [(i, 9, 0, 1) if direction == "in" else (9, i, 0, 1) for i in range(1, 7)]
+    nodes, edges = _frames(
+        [(i, 1, False) for i in [*range(1, 7), 9]],
+        rows + [(9, 9, 1_000_000, 1)],
+    )
+    result = analyze(nodes, edges, _transactions())
+    _assert_contract(result, nodes, edges)
+    row = result["nodes_roles"].set_index("gid").loc[9]
+    assert row["role"] == "peripheral"
+    assert row["role_score"] == 0
+
+
+@pytest.mark.parametrize("direction,role", [("in", "consolidator"), ("out", "distributor")])
+def test_large_self_loop_does_not_inflate_a_real_external_flow_role(direction, role):
+    rows = [(i, 9, 100, 1) if direction == "in" else (9, i, 100, 1) for i in range(1, 7)]
+    nodes, edges = _frames([(i, 1, False) for i in [*range(1, 7), 9]], rows)
+    expected = analyze(nodes, edges, _transactions())["nodes_roles"].set_index("gid").loc[9]
+    _, with_self = _frames([], rows + [(9, 9, 1e20, 1)])
+    result = analyze(nodes, with_self, _transactions())
+    _assert_contract(result, nodes, with_self)
+    actual = result["nodes_roles"].set_index("gid").loc[9]
+    features = compute_features(nodes, with_self).set_index("gid").loc[9]
+    assert actual["role"] == expected["role"] == role
+    assert actual["role_score"] == expected["role_score"]
+    assert features[f"external_{direction}_sum"] == 600
+    assert features[f"funded_{direction}_degree"] == 6
+    assert "600 KZT" in actual["evidence"]
+    assert "Самопереводы" in actual["evidence"]
+
+
 @pytest.mark.parametrize("outflow,depth,seed,expected", [
     (0, 3, False, "terminal"), (10, 3, False, "terminal"),
     (11, 3, False, "peripheral"), (79, 3, False, "peripheral"),
@@ -259,12 +292,68 @@ def test_large_int64_ids_shuffling_and_input_immutability(count):
 def test_reciprocal_projection_sums_weights_without_losing_direction(monkeypatch):
     nodes, edges = _frames([(1, 0, True), (2, 1, False), (3, 1, False)], [(1, 2, 30, 1), (2, 1, 70, 1), (2, 3, 0, 1)])
     def check_projection(graph, weight, seed):
-        assert list(graph.edges(data=True)) == [(1, 2, {"weight": 100})]
+        assert list(graph.edges(data=True)) == [(1, 2, {"weight": 1.0})]
         return [{1, 2}]
     monkeypatch.setattr("apexflow.analytics.nx.algorithms.community.louvain_communities", check_projection)
     result = analyze(nodes, edges, _transactions())
     _assert_contract(result, nodes, edges)
     assert result["clusters"].sum_kzt_internal.tolist() == [100, 0]
+
+
+@pytest.mark.parametrize("scale", [1e-200, 1.0, 1e200])
+def test_clustering_is_invariant_to_finite_monetary_scale(scale):
+    nodes, edges = _frames(
+        [(1, 0, True), (2, 1, False), (3, 1, False), (4, 2, False), (5, 0, True)],
+        [(1, 2, 100, 1), (2, 3, 1, 1), (3, 4, 100, 1)],
+    )
+    expected = assign_clusters(nodes, edges)
+    assert expected["cluster_id"].tolist() == [1, 1, 2, 2, 3]
+    scaled = edges.assign(sum_kzt=edges["sum_kzt"] * scale)
+    actual = assign_clusters(nodes, scaled)
+    assert_frame_equal(actual, expected, check_exact=True)
+    # Only the community weights are normalised; CSV turnover retains KZT.
+    result = analyze(nodes, scaled, _transactions())
+    _assert_contract(result, nodes, scaled)
+    assert result["clusters"]["sum_kzt_internal"].tolist() == pytest.approx(
+        [100 * scale, 100 * scale, 0], rel=1e-12, abs=0
+    )
+
+
+@pytest.mark.parametrize("transaction_count", [2**53 + 1, 2**63 - 1])
+def test_transaction_counts_remain_exact_above_float_and_int64_sum_limits(transaction_count):
+    nodes, edges = _frames(
+        [(1, 0, True), (2, 0, True), (3, 1, False)],
+        [(1, 3, 100, transaction_count), (2, 3, 100, transaction_count)],
+    )
+    features = compute_features(nodes, edges).set_index("gid")
+    assert features["in_n_tx"].to_dict() == {1: 0, 2: 0, 3: 2 * transaction_count}
+    assert features["out_n_tx"].to_dict() == {1: transaction_count, 2: transaction_count, 3: 0}
+
+
+@pytest.mark.parametrize("integer_dtype,boolean_dtype,money_dtype", [
+    ("Int64", "boolean", "Float64"),
+    ("int64[pyarrow]", "bool[pyarrow]", "double[pyarrow]"),
+])
+def test_nullable_and_arrow_inputs_preserve_large_identifiers_and_results(
+    integer_dtype, boolean_dtype, money_dtype
+):
+    if "pyarrow" in integer_dtype:
+        pytest.importorskip("pyarrow")
+    base = 2**63 - 5
+    nodes, edges = _frames(
+        [(base + i, min(i, 4), i == 0) for i in range(5)],
+        [(base, base + 1, 100, 1), (base + 1, base + 2, 90, 1)],
+    )
+    expected = analyze(nodes, edges, _transactions())
+    typed_nodes = nodes.astype({"gid": integer_dtype, "depth": integer_dtype, "is_seed": boolean_dtype})
+    typed_edges = edges.astype({
+        "src": integer_dtype, "dst": integer_dtype,
+        "n_tx": integer_dtype, "sum_kzt": money_dtype,
+    })
+    actual = analyze(typed_nodes, typed_edges, _transactions())
+    _assert_contract(actual, typed_nodes, typed_edges)
+    for name in expected:
+        assert_frame_equal(actual[name], expected[name], check_exact=True)
 
 
 @pytest.mark.parametrize("table,column,values", [
@@ -297,6 +386,7 @@ def test_integer_amounts_do_not_overflow_before_aggregation():
 
 def test_evidence_reserves_space_for_observation_limitations():
     row = pd.Series({"role": "consolidator", "in_degree": 1000000,
+        "funded_in_degree": 1000000, "external_in_sum": 1e30,
         "in_sum": 1e30, "flow_ratio": 1e20, "is_seed": True,
         "is_boundary": True, "has_self_loop": True, "self_sum": 1e10})
     evidence = make_evidence(row)
